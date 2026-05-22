@@ -26,6 +26,15 @@ logs/
 go.work
 go.work.sum
 
+# Python
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # env file
 .env
 

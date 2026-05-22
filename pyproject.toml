@@ -1,0 +1,22 @@
+[project]
+name = "auto-reset-remaining"
+version = "0.1.0"
+description = "Monitor RayPlus balance and reset Codex subscription quota."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.2.0",
+]
+
+[project.scripts]
+auto-reset = "auto_reset_remaining.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/auto_reset_remaining"]

@@ -1,6 +1,6 @@
 # auto_reset_remaining
 
-Go service for monitoring RayPlus API balance and resetting Codex subscription quota.
+Python service for monitoring RayPlus API balance and resetting Codex subscription quota.
 
 ## Features
 
@@ -17,12 +17,12 @@ Go service for monitoring RayPlus API balance and resetting Codex subscription q
 1. Copy `.env.example` to `.env`.
 2. Fill all secrets and connection fields in `.env`.
 3. Create the PostgreSQL database configured by `pg_host`, `pg_port`, `pg_user`, `pg_password`, `pg_database`, and `pg_sslmode`.
-4. Run:
+4. Install dependencies and run with uv:
 
 ```powershell
-go mod tidy
-go test ./...
-go run ./cmd/auto-reset
+uv sync
+uv run python -m unittest discover -s tests
+uv run auto-reset
 ```
 
 The service creates its required PostgreSQL tables on startup.
