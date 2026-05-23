@@ -1,0 +1,76 @@
+# Non-secret runtime configuration for auto_reset_remaining.
+# Copy this file to config.toml and edit local values there.
+
+[rayplus]
+base_url = "https://rayplus.site"
+user_agent = "auto-reset-remaining/1.0"
+balance_json_path = ""
+
+[codex]
+base_url = "https://codex.rayplus.site"
+subscription_id = 0
+
+[smtp]
+host = "smtp.example.com"
+port = 587
+from = "you@example.com"
+to = ["receiver@example.com"]
+
+[postgres]
+sslmode = "disable"
+
+[http]
+public_base_url = "https://your-public-service.example.com"
+addr = "127.0.0.1:8080"
+
+[logs]
+query_log_dir = "logs"
+
+[logs.rotation]
+enabled = false
+archive_dir = "log_archives"
+
+[reset]
+low_balance_threshold = 0.5
+auto_reset_enabled = false
+manual_confirm_success_count = 0
+confirm_token_ttl = "24h"
+cooldown = "1m"
+manual_confirm_time_range = ""
+
+[polling]
+default_interval = "1s"
+balance_change_epsilon = 0.000001
+
+[polling.subscription]
+enabled = false
+quota = 0
+
+[[polling.subscription.tiers]]
+min_ratio = 0.70
+interval = "1m"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.40
+interval = "30s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.20
+interval = "10s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.000001
+interval = "3s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0
+interval = "1s"
+
+[polling.sleep]
+enabled = false
+unchanged_for = "10m"
+interval = "1m"
+
+[polling.after_reset_email]
+enabled = false
+interval = "1m"

@@ -26,8 +26,12 @@ func main() {
 	if value := os.Getenv("ENV_FILE"); value != "" {
 		envPath = value
 	}
+	configPath := "config.toml"
+	if value := os.Getenv("CONFIG_FILE"); value != "" {
+		configPath = value
+	}
 
-	cfg, err := config.Load(envPath)
+	cfg, err := config.Load(envPath, configPath)
 	if err != nil {
 		logger.Fatalf("load config: %v", err)
 	}

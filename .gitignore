@@ -28,6 +28,7 @@ go.work.sum
 
 # env file
 .env
+config.toml
 
 # Editor/IDE
 # .idea/
