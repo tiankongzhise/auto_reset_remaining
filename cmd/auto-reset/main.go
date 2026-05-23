@@ -64,16 +64,21 @@ func main() {
 	})
 	sender := mailer.NewSMTPMailer(cfg.SMTP)
 	queryLogger := service.NewQueryLogger(cfg.QueryLogDir)
+	logRotator := service.NewLogRotator(cfg, queryLogger, logger)
 	monitor := service.NewMonitor(cfg, envPath, apiClient, sender, dataStore, queryLogger, logger)
 	if err := monitor.Initialize(ctx); err != nil {
 		logger.Fatalf("initialize monitor: %v", err)
 	}
 
 	go monitor.Run(ctx)
+	if logRotator.Enabled() {
+		go logRotator.RunDaily(ctx)
+		logger.Print("log rotation enabled at 02:00 local time")
+	}
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           service.NewHTTPHandler(monitor),
+		Handler:           service.NewHTTPHandler(monitor, logRotator),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

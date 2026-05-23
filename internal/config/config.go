@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,10 +26,13 @@ type Config struct {
 	SMTP SMTPConfig
 	PG   PGConfig
 
-	PublicBaseURL string
-	HTTPAddr      string
-	QueryLogDir   string
-	UserAgent     string
+	PublicBaseURL         string
+	HTTPAddr              string
+	QueryLogDir           string
+	LogRotationEnabled    bool
+	LogRotationArchiveDir string
+	LogRotationKey        string
+	UserAgent             string
 
 	LowBalanceThreshold       float64
 	BalanceJSONPath           string
@@ -69,22 +73,25 @@ func Load(path string) (Config, error) {
 		return fileValues[key]
 	}
 	cfg := Config{
-		EnvPath:             path,
-		RayPlusBaseURL:      defaultString(lookup("RAYPLUS_BASE_URL"), "https://rayplus.site"),
-		RayPlusAPIKey:       lookup("RAYPLUS_API_KEY"),
-		RayPlusEmail:        lookup("RAYPLUS_EMAIL"),
-		RayPlusPassword:     lookup("RAYPLUS_PASSWORD"),
-		CodexBaseURL:        defaultString(lookup("CODEX_BASE_URL"), "https://codex.rayplus.site"),
-		PublicBaseURL:       strings.TrimRight(lookup("PUBLIC_BASE_URL"), "/"),
-		HTTPAddr:            defaultString(lookup("HTTP_ADDR"), ":8080"),
-		QueryLogDir:         defaultString(lookup("QUERY_LOG_DIR"), "logs"),
-		UserAgent:           defaultString(lookup("USER_AGENT"), "auto-reset-remaining/1.0"),
-		LowBalanceThreshold: parseFloatDefault(lookup("LOW_BALANCE_THRESHOLD"), 0.5),
-		BalanceJSONPath:     lookup("BALANCE_JSON_PATH"),
-		AutoResetEnabled:    parseBoolDefault(lookup("AUTO_RESET_ENABLED"), false),
-		PollInterval:        parseDurationDefault(lookup("POLL_INTERVAL"), time.Second),
-		ConfirmTokenTTL:     parseDurationDefault(lookup("CONFIRM_TOKEN_TTL"), 24*time.Hour),
-		ResetCooldown:       parseDurationDefault(lookup("RESET_COOLDOWN"), time.Minute),
+		EnvPath:               path,
+		RayPlusBaseURL:        defaultString(lookup("RAYPLUS_BASE_URL"), "https://rayplus.site"),
+		RayPlusAPIKey:         lookup("RAYPLUS_API_KEY"),
+		RayPlusEmail:          lookup("RAYPLUS_EMAIL"),
+		RayPlusPassword:       lookup("RAYPLUS_PASSWORD"),
+		CodexBaseURL:          defaultString(lookup("CODEX_BASE_URL"), "https://codex.rayplus.site"),
+		PublicBaseURL:         strings.TrimRight(lookup("PUBLIC_BASE_URL"), "/"),
+		HTTPAddr:              defaultString(lookup("HTTP_ADDR"), ":8080"),
+		QueryLogDir:           defaultString(lookup("QUERY_LOG_DIR"), "logs"),
+		LogRotationEnabled:    parseBoolDefault(lookup("LOG_ROTATION_ENABLED"), false),
+		LogRotationArchiveDir: strings.TrimSpace(lookup("LOG_ROTATION_ARCHIVE_DIR")),
+		LogRotationKey:        strings.TrimSpace(lookup("LOG_ROTATION_KEY")),
+		UserAgent:             defaultString(lookup("USER_AGENT"), "auto-reset-remaining/1.0"),
+		LowBalanceThreshold:   parseFloatDefault(lookup("LOW_BALANCE_THRESHOLD"), 0.5),
+		BalanceJSONPath:       lookup("BALANCE_JSON_PATH"),
+		AutoResetEnabled:      parseBoolDefault(lookup("AUTO_RESET_ENABLED"), false),
+		PollInterval:          parseDurationDefault(lookup("POLL_INTERVAL"), time.Second),
+		ConfirmTokenTTL:       parseDurationDefault(lookup("CONFIRM_TOKEN_TTL"), 24*time.Hour),
+		ResetCooldown:         parseDurationDefault(lookup("RESET_COOLDOWN"), time.Minute),
 		SMTP: SMTPConfig{
 			Host:     lookup("SMTP_HOST"),
 			Port:     parseIntDefault(lookup("SMTP_PORT"), 587),
@@ -140,6 +147,16 @@ func (c Config) Validate() error {
 	if c.LowBalanceThreshold <= 0 {
 		return fmt.Errorf("LOW_BALANCE_THRESHOLD must be greater than 0")
 	}
+	if c.LogRotationEnabled {
+		if strings.TrimSpace(c.LogRotationArchiveDir) == "" {
+			missing = append(missing, "LOG_ROTATION_ARCHIVE_DIR")
+		} else if samePath(c.QueryLogDir, c.LogRotationArchiveDir) {
+			return fmt.Errorf("LOG_ROTATION_ARCHIVE_DIR must be different from QUERY_LOG_DIR")
+		}
+		if strings.TrimSpace(c.LogRotationKey) == "" {
+			missing = append(missing, "LOG_ROTATION_KEY")
+		}
+	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be greater than 0")
 	}
@@ -164,6 +181,15 @@ func (c Config) PostgresConnString() string {
 		parts = append(parts, "password="+quotePGValue(c.PG.Password))
 	}
 	return strings.Join(parts, " ")
+}
+
+func samePath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	}
+	return strings.EqualFold(filepath.Clean(leftAbs), filepath.Clean(rightAbs))
 }
 
 func (c Config) SMTPAddress() string {
