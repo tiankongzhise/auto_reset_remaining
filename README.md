@@ -4,60 +4,85 @@
 
 ## 功能
 
-- 按 `POLL_INTERVAL` 配置周期查询 `GET /v1/usage`。
-- 当余额低于 `LOW_BALANCE_THRESHOLD` 时，只发送一封低余额确认邮件，避免重复打扰。
-- 用户点击邮件确认链接后，执行订阅重置。
-- 人工确认重置成功累计 3 次后，自动更新 `.env` 并开启自动重置。
-- 自动重置模式下，当余额 `<= 0` 时直接执行重置。
-- 将余额查询日志写入本地 JSONL 文件。
-- 可选开启本地日志轮转，每天本地时间 02:00 归档日志文件。
+- 查询 `GET /v1/usage` 并记录本地 JSONL 查询日志。
+- 低余额时发送确认邮件，并避免重复发送。
+- 用户点击邮件确认链接后执行订阅重置。
+- 人工确认重置成功累计 3 次后，自动开启自动重置。
+- 自动重置模式下，余额 `<= 0` 时执行重置。
+- 支持必须人工确认的时间段，在该时间段内即使处于自动阶段也会改发确认邮件。
+- 支持按订阅剩余额度比例、休眠状态、重置邮件后状态动态调整查询频率。
+- 支持每天本地时间 02:00 轮转本地查询日志。
 - 将重置日志和确认令牌写入 PostgreSQL。
 
-## 安装与运行
+## 配置
 
-1. 复制 `.env.example` 为 `.env`。
-2. 在 `.env` 中填写所有密钥、邮箱、数据库和服务配置。
-3. 创建 PostgreSQL 数据库，连接信息由 `pg_host`、`pg_port`、`pg_user`、`pg_password`、`pg_database`、`pg_sslmode` 控制。
-4. 运行服务：
+配置拆成两个文件：
+
+- `.env`：只放机密、身份、访问控制、数据库连接敏感信息。
+- `config.toml`：放非机密运行配置和查询策略，支持注释。
+
+`.env.example` 是最新 `.env` 格式模板；不要从本机旧 `.env` 推断完整配置格式。`config.example.toml` 是最新 TOML 配置模板。
+
+初始化配置：
+
+```powershell
+Copy-Item .env.example .env
+Copy-Item config.example.toml config.toml
+```
+
+默认读取 `.env` 和 `config.toml`。也可以用环境变量指定路径：
+
+```powershell
+$env:ENV_FILE="C:\path\to\.env"
+$env:CONFIG_FILE="C:\path\to\config.toml"
+go run ./cmd/auto-reset
+```
+
+## 运行
 
 ```powershell
 go mod tidy
+$env:GOCACHE=(Resolve-Path .gocache).Path
 go test ./...
 go run ./cmd/auto-reset
 ```
 
 服务启动时会自动创建需要的 PostgreSQL 表。
 
+## 动态查询
+
+查询间隔优先级从高到低：
+
+1. 重置确认邮件发送后快速查询：`polling.after_reset_email`。
+2. 余额长期不变后的休眠查询：`polling.sleep`。
+3. 订阅额度比例分档查询：`polling.subscription.tiers`。
+4. 默认查询间隔：`polling.default_interval`。
+
+订阅模式开启时，`polling.subscription.quota` 必须大于 0，tiers 会按 `min_ratio` 从高到低匹配。余额变化判断使用 `polling.balance_change_epsilon`，默认 `0.000001`。
+
 ## 日志轮转
 
-日志轮转只处理本地日志目录 `QUERY_LOG_DIR` 下的普通文件，不会轮转 PostgreSQL 中的数据库日志。
+日志轮转目录和开关在 `config.toml`：
 
-相关 `.env` 配置：
+```toml
+[logs]
+query_log_dir = "logs"
+
+[logs.rotation]
+enabled = false
+archive_dir = "log_archives"
+```
+
+外部调用轮转接口的 key 在 `.env`：
 
 ```env
-QUERY_LOG_DIR=logs
-LOG_ROTATION_ENABLED=false
-LOG_ROTATION_ARCHIVE_DIR=log_archives
 LOG_ROTATION_KEY=change-this-log-rotation-key
 ```
 
-- `LOG_ROTATION_ENABLED=true` 时，服务会在每天本地时间 02:00 自动轮转本地日志。
-- `LOG_ROTATION_ARCHIVE_DIR` 是归档目录；如果目录不存在，服务会在轮转时尝试创建。
-- 如果归档目录不可用或创建失败，本次轮转会降级为跳过，不会影响服务继续运行。
-- 每次成功轮转会在归档目录下创建一个时间戳子目录，并把 `QUERY_LOG_DIR` 下的普通文件移动进去。
-- `LOG_ROTATION_ARCHIVE_DIR` 不能和 `QUERY_LOG_DIR` 指向同一目录。
-
-也可以通过 GET 接口手动触发日志轮转：
+手动轮转接口：
 
 ```text
 GET /rotate-logs?key=<LOG_ROTATION_KEY>
 ```
 
-密钥与 `.env` 中的 `LOG_ROTATION_KEY` 一致时才会触发。接口返回 JSON，包含归档目录、轮转文件列表、总字节数；如果本次未轮转，会返回 `skipped_reason` 说明原因。
-
-## 配置说明
-
-- `.env` 不要提交到仓库，当前已由 `.gitignore` 忽略。
-- `HTTP_ADDR` 控制服务监听地址；如果放在 nginx 后面，建议绑定到本地地址，例如 `127.0.0.1:8080`。
-- `PUBLIC_BASE_URL` 只用于生成邮件中的确认链接，应设置为 nginx 暴露给外部访问的地址，例如 `https://your-domain.example.com`。
-- 如果 usage 响应中没有可识别的余额字段，可以设置 `BALANCE_JSON_PATH`，例如 `data.balance`。
+`archive_dir` 不能和 `query_log_dir` 指向同一目录。
