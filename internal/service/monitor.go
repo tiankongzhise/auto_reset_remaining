@@ -9,15 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"auto_reset_remaining/internal/api"
 	"auto_reset_remaining/internal/config"
-	"auto_reset_remaining/internal/envfile"
 	"auto_reset_remaining/internal/mailer"
 	"auto_reset_remaining/internal/store"
 )
@@ -28,18 +28,24 @@ type APIClient interface {
 }
 
 type Monitor struct {
-	cfg     config.Config
-	envPath string
-	api     APIClient
-	mailer  mailer.Sender
-	store   store.Store
-	queries *QueryLogger
-	logger  *log.Logger
+	cfg        config.Config
+	configPath string
+	api        APIClient
+	mailer     mailer.Sender
+	store      store.Store
+	queries    *QueryLogger
+	logger     *log.Logger
 
 	mu                 sync.Mutex
 	pendingManualEmail bool
 	resetInFlight      bool
 	lastAutoReset      time.Time
+
+	hasLastBalance              bool
+	lastBalance                 float64
+	lastBalanceChangedAt        time.Time
+	forceFastUntilBalanceChange bool
+	forceFastReferenceBalance   float64
 }
 
 type ConfirmResult struct {
@@ -54,14 +60,18 @@ func NewMonitor(cfg config.Config, envPath string, apiClient APIClient, sender m
 	if logger == nil {
 		logger = log.Default()
 	}
+	configPath := cfg.TOMLPath
+	if configPath == "" {
+		configPath = envPath
+	}
 	return &Monitor{
-		cfg:     cfg,
-		envPath: envPath,
-		api:     apiClient,
-		mailer:  sender,
-		store:   dataStore,
-		queries: queries,
-		logger:  logger,
+		cfg:        cfg,
+		configPath: configPath,
+		api:        apiClient,
+		mailer:     sender,
+		store:      dataStore,
+		queries:    queries,
+		logger:     logger,
 	}
 }
 
@@ -77,15 +87,16 @@ func (m *Monitor) Initialize(ctx context.Context) error {
 }
 
 func (m *Monitor) Run(ctx context.Context) {
-	m.tickAndLog(ctx)
-	ticker := time.NewTicker(m.cfg.PollInterval)
-	defer ticker.Stop()
+	next := m.tickAndLog(ctx)
+	timer := time.NewTimer(next)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			m.tickAndLog(ctx)
+		case <-timer.C:
+			next = m.tickAndLog(ctx)
+			timer.Reset(next)
 		}
 	}
 }
@@ -94,11 +105,12 @@ func (m *Monitor) Tick(ctx context.Context) (string, error) {
 	return m.handleTick(ctx)
 }
 
-func (m *Monitor) tickAndLog(ctx context.Context) {
+func (m *Monitor) tickAndLog(ctx context.Context) time.Duration {
 	status, err := m.handleTick(ctx)
 	if err != nil {
 		m.logger.Printf("tick status=%s error=%v", status, err)
 	}
+	return m.nextPollInterval(time.Now())
 }
 
 func (m *Monitor) handleTick(ctx context.Context) (string, error) {
@@ -115,6 +127,7 @@ func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 		return entry.Status, err
 	}
 	entry.Balance = &result.Balance
+	m.observeBalance(start, result.Balance)
 
 	status, actionErr := m.handleBalance(ctx, result.Balance)
 	entry.Status = status
@@ -132,6 +145,9 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, e
 	cfg := m.snapshot()
 	if cfg.AutoResetEnabled {
 		if balance <= 0 {
+			if cfg.ManualConfirmWindow.Contains(time.Now()) {
+				return m.maybeSendConfirmEmail(ctx, balance, cfg, "manual_confirm")
+			}
 			return m.maybeAutoReset(ctx, balance, cfg.ResetCooldown)
 		}
 		return "ok", nil
@@ -144,11 +160,15 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, e
 		return "ok", nil
 	}
 
+	return m.maybeSendConfirmEmail(ctx, balance, cfg, "low_balance")
+}
+
+func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cfg config.Config, statusPrefix string) (string, error) {
 	m.mu.Lock()
 	pending := m.pendingManualEmail
 	m.mu.Unlock()
 	if pending {
-		return "low_balance_email_pending", nil
+		return statusPrefix + "_email_pending", nil
 	}
 
 	hasActive, err := m.store.HasActiveConfirmToken(ctx)
@@ -159,7 +179,7 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, e
 		m.mu.Lock()
 		m.pendingManualEmail = true
 		m.mu.Unlock()
-		return "low_balance_email_pending", nil
+		return statusPrefix + "_email_pending", nil
 	}
 
 	rawToken, tokenHash, err := newConfirmToken()
@@ -177,13 +197,17 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, e
 		balance, cfg.LowBalanceThreshold, link, expiresAt.Format(time.RFC3339))
 	if err := m.mailer.Send(ctx, subject, body); err != nil {
 		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
-		return "low_balance_email_error", err
+		return statusPrefix + "_email_error", err
 	}
 
 	m.mu.Lock()
 	m.pendingManualEmail = true
+	if cfg.Polling.AfterResetEmail.Enabled {
+		m.forceFastUntilBalanceChange = true
+		m.forceFastReferenceBalance = balance
+	}
 	m.mu.Unlock()
-	return "low_balance_email_sent", nil
+	return statusPrefix + "_email_sent", nil
 }
 
 func (m *Monitor) maybeAutoReset(ctx context.Context, balance float64, cooldown time.Duration) (string, error) {
@@ -235,7 +259,7 @@ func (m *Monitor) Confirm(ctx context.Context, rawToken string) (ConfirmResult, 
 
 	count, autoEnabled, err := m.incrementManualSuccess()
 	if err != nil {
-		return ConfirmResult{}, fmt.Errorf("reset succeeded but failed to update .env state: %w", err)
+		return ConfirmResult{}, fmt.Errorf("reset succeeded but failed to update config.toml state: %w", err)
 	}
 	if err := m.store.MarkConfirmTokenReset(ctx, token.ID, resetLogID, count); err != nil {
 		return ConfirmResult{}, fmt.Errorf("reset succeeded but failed to update confirm token: %w", err)
@@ -282,13 +306,7 @@ func (m *Monitor) incrementManualSuccess() (int, bool, error) {
 
 	next := m.cfg.ManualConfirmSuccessCount + 1
 	autoEnabled := m.cfg.AutoResetEnabled || next >= 3
-	updates := map[string]string{
-		"MANUAL_CONFIRM_SUCCESS_COUNT": strconv.Itoa(next),
-	}
-	if autoEnabled {
-		updates["AUTO_RESET_ENABLED"] = "true"
-	}
-	if err := envfile.UpdateValues(m.envPath, updates); err != nil {
+	if err := config.UpdateRuntimeState(m.configPath, next, autoEnabled); err != nil {
 		return m.cfg.ManualConfirmSuccessCount, m.cfg.AutoResetEnabled, err
 	}
 	m.cfg.ManualConfirmSuccessCount = next
@@ -300,6 +318,91 @@ func (m *Monitor) snapshot() config.Config {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.cfg
+}
+
+func (m *Monitor) observeBalance(now time.Time, balance float64) {
+	cfg := m.snapshot()
+	epsilon := cfg.Polling.BalanceChangeEpsilon
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.hasLastBalance {
+		m.hasLastBalance = true
+		m.lastBalance = balance
+		m.lastBalanceChangedAt = now
+		return
+	}
+	if !balanceChanged(m.lastBalance, balance, epsilon) {
+		return
+	}
+	m.lastBalance = balance
+	m.lastBalanceChangedAt = now
+	if m.forceFastUntilBalanceChange && balanceChanged(m.forceFastReferenceBalance, balance, epsilon) {
+		m.forceFastUntilBalanceChange = false
+	}
+}
+
+func (m *Monitor) nextPollInterval(now time.Time) time.Duration {
+	cfg := m.snapshot()
+	m.mu.Lock()
+	state := pollingState{
+		HasLastBalance:              m.hasLastBalance,
+		LastBalance:                 m.lastBalance,
+		LastBalanceChangedAt:        m.lastBalanceChangedAt,
+		ForceFastUntilBalanceChange: m.forceFastUntilBalanceChange,
+	}
+	m.mu.Unlock()
+	return nextPollInterval(cfg.Polling, state, now)
+}
+
+type pollingState struct {
+	HasLastBalance              bool
+	LastBalance                 float64
+	LastBalanceChangedAt        time.Time
+	ForceFastUntilBalanceChange bool
+}
+
+func nextPollInterval(cfg config.PollingConfig, state pollingState, now time.Time) time.Duration {
+	if cfg.AfterResetEmail.Enabled && state.ForceFastUntilBalanceChange {
+		return positiveDuration(cfg.AfterResetEmail.Interval, cfg.DefaultInterval)
+	}
+	if cfg.Sleep.Enabled && state.HasLastBalance && !state.LastBalanceChangedAt.IsZero() && now.Sub(state.LastBalanceChangedAt) >= cfg.Sleep.UnchangedFor {
+		return positiveDuration(cfg.Sleep.Interval, cfg.DefaultInterval)
+	}
+	if cfg.Subscription.Enabled && cfg.Subscription.Quota > 0 && state.HasLastBalance {
+		ratio := state.LastBalance / cfg.Subscription.Quota
+		if ratio > 1 {
+			ratio = 1
+		}
+		for _, tier := range sortedTiers(cfg.Subscription.Tiers) {
+			if ratio >= tier.MinRatio {
+				return positiveDuration(tier.Interval, cfg.DefaultInterval)
+			}
+		}
+	}
+	return positiveDuration(cfg.DefaultInterval, time.Second)
+}
+
+func sortedTiers(tiers []config.SubscriptionTier) []config.SubscriptionTier {
+	sorted := append([]config.SubscriptionTier(nil), tiers...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].MinRatio > sorted[j].MinRatio
+	})
+	return sorted
+}
+
+func positiveDuration(value, fallback time.Duration) time.Duration {
+	if value > 0 {
+		return value
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return time.Second
+}
+
+func balanceChanged(a, b, epsilon float64) bool {
+	return math.Abs(a-b) > epsilon
 }
 
 func newConfirmToken() (raw string, hash string, err error) {
