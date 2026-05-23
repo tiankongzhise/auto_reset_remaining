@@ -30,5 +30,6 @@ The service creates its required PostgreSQL tables on startup.
 ## Notes
 
 - Do not commit `.env`; it is ignored by git.
-- `PUBLIC_BASE_URL` must be reachable by the email recipient because confirmation links are generated from it.
+- `HTTP_ADDR` controls where this process listens. When running behind nginx, bind it to a local address such as `127.0.0.1:8080`.
+- `PUBLIC_BASE_URL` is only used to build confirmation links in email. Set it to the externally reachable nginx URL, for example `https://your-domain.example.com`.
 - If the usage response does not expose a recognizable balance field, set `BALANCE_JSON_PATH`, for example `data.balance`.
