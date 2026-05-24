@@ -147,6 +147,106 @@ func TestAutoModeUsesManualConfirmWindow(t *testing.T) {
 	}
 }
 
+func TestDailyMaxResetSendsLimitEmailAfterReset(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		AutoResetEnabled:   true,
+		ResetCooldown:      -1,
+		DailyMaxResetCount: 1,
+	})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "auto_reset_success" {
+		t.Fatalf("Tick() status = %s", status)
+	}
+	if apiClient.resetCalls != 1 {
+		t.Fatalf("resetCalls = %d, want 1", apiClient.resetCalls)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages = %d, want 1", got)
+	}
+	if !strings.Contains(sender.messages[0], "今日重置次数已达到上限") {
+		t.Fatalf("daily limit email not sent:\n%s", sender.messages[0])
+	}
+}
+
+func TestDailyLimitSendsPlanEmailThenPausesQueries(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	dataStore.resetLogs = append(dataStore.resetLogs, store.ResetLog{Mode: "auto", Success: true})
+	dataStore.dailyState(todayKey()).dailyLimitEmailSent = true
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		AutoResetEnabled:   true,
+		DailyMaxResetCount: 1,
+	})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "plan_refresh_limit_email_sent" {
+		t.Fatalf("Tick() status = %s", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages = %d, want 1", got)
+	}
+	if !strings.Contains(sender.messages[0], "已达到当前套餐可刷新上限") {
+		t.Fatalf("plan limit email not sent:\n%s", sender.messages[0])
+	}
+	if apiClient.balanceCalls != 1 {
+		t.Fatalf("balanceCalls = %d, want 1 before pause", apiClient.balanceCalls)
+	}
+
+	status, err = monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("second Tick() error = %v", err)
+	}
+	if status != "balance_query_paused" {
+		t.Fatalf("second Tick() status = %s", status)
+	}
+	if apiClient.balanceCalls != 1 {
+		t.Fatalf("balanceCalls = %d, want still 1 after pause", apiClient.balanceCalls)
+	}
+	if policy := monitor.nextPollPolicy(time.Now()); policy.Name != "balance_query_pause" || policy.Interval <= 0 {
+		t.Fatalf("nextPollPolicy() after pause = %+v, want balance query pause with positive interval", policy)
+	}
+}
+
+func TestConfirmRejectsWhenDailyLimitReachedWithoutConsumingToken(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	dataStore.resetLogs = append(dataStore.resetLogs, store.ResetLog{Mode: "auto", Success: true})
+	rawToken := "manual-confirm-token"
+	tokenHash := hashToken(rawToken)
+	if err := dataStore.CreateConfirmToken(ctx, tokenHash, 0.4, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		DailyMaxResetCount: 1,
+	})
+
+	_, err := monitor.Confirm(ctx, rawToken)
+	if !errors.Is(err, ErrDailyResetLimitReached) {
+		t.Fatalf("Confirm() error = %v, want ErrDailyResetLimitReached", err)
+	}
+	if apiClient.resetCalls != 0 {
+		t.Fatalf("resetCalls = %d, want 0", apiClient.resetCalls)
+	}
+	if dataStore.tokens[tokenHash].used {
+		t.Fatal("confirm token was consumed")
+	}
+}
+
 func TestNextPollIntervalUsesSubscriptionTiers(t *testing.T) {
 	cfg := config.PollingConfig{
 		DefaultInterval:      time.Second,
@@ -245,6 +345,9 @@ func newTestMonitor(t *testing.T, apiClient *fakeAPI, sender *fakeMailer, dataSt
 	if overrides.ManualConfirmWindow.Enabled {
 		cfg.ManualConfirmWindow = overrides.ManualConfirmWindow
 	}
+	if overrides.DailyMaxResetCount != 0 {
+		cfg.DailyMaxResetCount = overrides.DailyMaxResetCount
+	}
 	return NewMonitor(cfg, "", apiClient, sender, dataStore, NewQueryLogger(cfg.QueryLogDir), nil)
 }
 
@@ -313,6 +416,7 @@ archive_dir = "archives"
 low_balance_threshold = 0.5
 auto_reset_enabled = {{AUTO_RESET_ENABLED}}
 manual_confirm_success_count = {{MANUAL_CONFIRM_SUCCESS_COUNT}}
+daily_max_reset_count = 0
 confirm_token_ttl = "24h"
 cooldown = "1m"
 manual_confirm_time_range = ""
@@ -340,14 +444,16 @@ interval = "1m"
 `
 
 type fakeAPI struct {
-	balance     float64
-	balanceErr  error
-	resetResult api.ResetResult
-	resetErr    error
-	resetCalls  int
+	balance      float64
+	balanceErr   error
+	resetResult  api.ResetResult
+	resetErr     error
+	balanceCalls int
+	resetCalls   int
 }
 
 func (f *fakeAPI) QueryBalance(context.Context) (api.BalanceResult, error) {
+	f.balanceCalls++
 	if f.balanceErr != nil {
 		return api.BalanceResult{}, f.balanceErr
 	}
@@ -378,6 +484,7 @@ func (f *fakeMailer) Send(_ context.Context, subject string, body string) error 
 type fakeStore struct {
 	tokens    map[string]fakeToken
 	resetLogs []store.ResetLog
+	daily     map[string]*fakeDailyState
 	nextID    int64
 }
 
@@ -389,7 +496,7 @@ type fakeToken struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{tokens: make(map[string]fakeToken), nextID: 1}
+	return &fakeStore{tokens: make(map[string]fakeToken), daily: make(map[string]*fakeDailyState), nextID: 1}
 }
 
 func (f *fakeStore) Init(context.Context) error {
@@ -439,6 +546,60 @@ func (f *fakeStore) LogReset(_ context.Context, entry store.ResetLog) (int64, er
 	id := f.nextID
 	f.nextID++
 	return id, nil
+}
+
+func (f *fakeStore) GetDailyResetLimitState(_ context.Context, day time.Time, maxResetCount int) (store.DailyResetLimitState, error) {
+	state := f.dailyState(dayKey(day))
+	count := 0
+	for _, entry := range f.resetLogs {
+		if entry.Success {
+			count++
+		}
+	}
+	return store.DailyResetLimitState{
+		Day:                       truncateTestDay(day),
+		ResetCount:                count,
+		MaxResetCount:             maxResetCount,
+		DailyLimitEmailSent:       state.dailyLimitEmailSent,
+		PlanRefreshLimitEmailSent: state.planRefreshLimitEmailSent,
+		BalanceQueryPaused:        maxResetCount > 0 && count >= maxResetCount && state.planRefreshLimitEmailSent,
+	}, nil
+}
+
+func (f *fakeStore) MarkDailyLimitEmailSent(_ context.Context, day time.Time) error {
+	f.dailyState(dayKey(day)).dailyLimitEmailSent = true
+	return nil
+}
+
+func (f *fakeStore) MarkPlanRefreshLimitEmailSent(_ context.Context, day time.Time) error {
+	f.dailyState(dayKey(day)).planRefreshLimitEmailSent = true
+	return nil
+}
+
+type fakeDailyState struct {
+	dailyLimitEmailSent       bool
+	planRefreshLimitEmailSent bool
+}
+
+func (f *fakeStore) dailyState(key string) *fakeDailyState {
+	state := f.daily[key]
+	if state == nil {
+		state = &fakeDailyState{}
+		f.daily[key] = state
+	}
+	return state
+}
+
+func todayKey() string {
+	return dayKey(time.Now())
+}
+
+func dayKey(t time.Time) string {
+	return truncateTestDay(t).Format("2006-01-02")
+}
+
+func truncateTestDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
 
 func extractToken(t *testing.T, message string) string {

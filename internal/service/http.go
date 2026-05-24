@@ -32,6 +32,9 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 			if errors.Is(err, store.ErrTokenInvalid) {
 				status = http.StatusBadRequest
 			}
+			if errors.Is(err, ErrDailyResetLimitReached) {
+				status = http.StatusTooManyRequests
+			}
 			http.Error(w, err.Error(), status)
 			return
 		}

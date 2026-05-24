@@ -9,6 +9,7 @@
 3. 用户点击邮件中的 `/confirm-reset?token=...` 链接后，服务调用 Codex 重置订阅额度。
 4. 人工确认重置成功累计 3 次后，服务会在 `config.toml` 中开启 `reset.auto_reset_enabled`。
 5. 开启自动重置后，余额 `<= 0` 时会自动重置；如果当前时间落入 `reset.manual_confirm_time_range`，仍然改为发送确认邮件。
+6. `reset.daily_max_reset_count` 大于 `0` 时，服务会限制每天成功重置次数；达到上限后发送邮件，余额再次消费到 `0` 后发送套餐刷新上限邮件并暂停余额查询，每日 0 点恢复。
 
 ## 准备环境
 
@@ -65,6 +66,7 @@ LOG_ROTATION_KEY=change-this-log-rotation-key
 - `smtp.host`、`smtp.port`、`smtp.from`、`smtp.to`：邮件服务器和收件人。
 - `postgres.sslmode`：PostgreSQL SSL 模式。
 - `reset.low_balance_threshold`：低余额邮件阈值。
+- `reset.daily_max_reset_count`：每日最大可重置次数；`0` 表示不限制。
 - `rayplus.balance_json_path`：当余额字段无法自动识别时设置，例如 `data.balance`。
 - `codex.subscription_id`：指定要重置的订阅 ID；填 `0` 时自动选择可重置的 active 订阅。
 

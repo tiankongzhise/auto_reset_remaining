@@ -78,6 +78,14 @@ func TestValidateSubscriptionRequiresQuotaAndTiers(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsNegativeDailyMaxResetCount(t *testing.T) {
+	cfg := validConfig()
+	cfg.DailyMaxResetCount = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "daily_max_reset_count") {
+		t.Fatalf("Validate() error = %v, want daily_max_reset_count error", err)
+	}
+}
+
 func TestManualConfirmWindowParsing(t *testing.T) {
 	window, err := parseManualConfirmWindow("22:00-09:00")
 	if err != nil {
@@ -176,6 +184,7 @@ archive_dir = "archives"
 low_balance_threshold = 0.5
 auto_reset_enabled = false
 manual_confirm_success_count = 2
+daily_max_reset_count = 0
 confirm_token_ttl = "24h"
 cooldown = "1m"
 manual_confirm_time_range = ""

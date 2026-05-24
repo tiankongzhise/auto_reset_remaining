@@ -34,6 +34,7 @@ archive_dir = "log_archives"
 low_balance_threshold = 0.5
 auto_reset_enabled = false
 manual_confirm_success_count = 0
+daily_max_reset_count = 0
 confirm_token_ttl = "24h"
 cooldown = "1m"
 manual_confirm_time_range = ""

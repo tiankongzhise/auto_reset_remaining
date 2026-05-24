@@ -22,6 +22,8 @@ import (
 	"auto_reset_remaining/internal/store"
 )
 
+var ErrDailyResetLimitReached = errors.New("daily reset limit reached")
+
 type APIClient interface {
 	QueryBalance(ctx context.Context) (api.BalanceResult, error)
 	ResetQuota(ctx context.Context) (api.ResetResult, error)
@@ -47,6 +49,7 @@ type Monitor struct {
 	forceFastUntilBalanceChange bool
 	forceFastReferenceBalance   float64
 	lastPollingPolicyKey        string
+	balanceQueryPausedUntil     time.Time
 }
 
 type ConfirmResult struct {
@@ -119,6 +122,46 @@ func (m *Monitor) tickAndLog(ctx context.Context) time.Duration {
 
 func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 	start := time.Now()
+	cfg := m.snapshot()
+	state, stateErr := m.dailyResetLimitState(ctx, cfg, start)
+	if stateErr != nil {
+		entry := QueryLogEntry{
+			Time:       start,
+			DurationMS: time.Since(start).Milliseconds(),
+			Status:     "daily_reset_limit_state_error",
+			Error:      stateErr.Error(),
+		}
+		_ = m.queries.Log(entry)
+		return entry.Status, stateErr
+	}
+	if state.BalanceQueryPaused {
+		m.pauseBalanceQueriesUntil(state.Day.AddDate(0, 0, 1))
+		entry := QueryLogEntry{
+			Time:       start,
+			DurationMS: time.Since(start).Milliseconds(),
+			Status:     "balance_query_paused",
+		}
+		if err := m.queries.Log(entry); err != nil {
+			return entry.Status, err
+		}
+		return entry.Status, nil
+	}
+	m.clearBalanceQueryPause()
+	if status, err := m.ensureDailyLimitEmail(ctx, cfg, state); err != nil || status != "" {
+		entry := QueryLogEntry{
+			Time:       start,
+			DurationMS: time.Since(start).Milliseconds(),
+			Status:     status,
+		}
+		if err != nil {
+			entry.Error = err.Error()
+		}
+		if logErr := m.queries.Log(entry); logErr != nil && err == nil {
+			err = logErr
+		}
+		return status, err
+	}
+
 	result, err := m.api.QueryBalance(ctx)
 	entry := QueryLogEntry{
 		Time:       start,
@@ -147,6 +190,16 @@ func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 
 func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, error) {
 	cfg := m.snapshot()
+	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	if err != nil {
+		return "daily_reset_limit_state_error", err
+	}
+	if state.MaxResetCount > 0 && state.ResetCount >= state.MaxResetCount {
+		if balance <= 0 {
+			return m.maybeSendPlanRefreshLimitEmail(ctx, balance, cfg, state)
+		}
+		return "daily_reset_limit_reached", nil
+	}
 	if cfg.AutoResetEnabled {
 		if balance <= 0 {
 			if cfg.ManualConfirmWindow.Contains(time.Now()) {
@@ -263,6 +316,23 @@ func (m *Monitor) Confirm(ctx context.Context, rawToken string) (ConfirmResult, 
 	tokenHash := hashToken(rawToken)
 	tokenPrefix := tokenHashPrefix(tokenHash)
 	m.logger.Printf("confirm reset URL requested token_hash_prefix=%s", tokenPrefix)
+
+	cfg := m.snapshot()
+	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	if err != nil {
+		m.logger.Printf("confirm reset URL rejected token_hash_prefix=%s reason=daily_limit_state_error error=%v", tokenPrefix, err)
+		return ConfirmResult{}, err
+	}
+	if state.MaxResetCount > 0 && state.ResetCount >= state.MaxResetCount {
+		if _, err := m.ensureDailyLimitEmail(ctx, cfg, state); err != nil {
+			m.logger.Printf("confirm reset URL rejected token_hash_prefix=%s reason=daily_limit_email_error error=%v", tokenPrefix, err)
+			return ConfirmResult{}, err
+		}
+		m.logger.Printf("confirm reset URL rejected token_hash_prefix=%s reason=daily_limit_reached reset_count=%d max=%d",
+			tokenPrefix, state.ResetCount, state.MaxResetCount)
+		return ConfirmResult{}, ErrDailyResetLimitReached
+	}
+
 	token, err := m.store.ConsumeConfirmToken(ctx, tokenHash)
 	if err != nil {
 		m.logger.Printf("confirm reset URL rejected token_hash_prefix=%s error=%v", tokenPrefix, err)
@@ -331,7 +401,76 @@ func (m *Monitor) executeReset(ctx context.Context, mode string, balance float64
 	}
 	m.logger.Printf("subscription reset succeeded mode=%s balance=%.6f subscription_id=%d http_status=%d reset_log_id=%d response=%s",
 		mode, balance, result.SubscriptionID, result.HTTPStatus, resetLogID, result.ResponseSummary)
+	m.notifyDailyLimitAfterReset(ctx)
 	return result, resetLogID, nil
+}
+
+func (m *Monitor) notifyDailyLimitAfterReset(ctx context.Context) {
+	cfg := m.snapshot()
+	if cfg.DailyMaxResetCount <= 0 {
+		return
+	}
+	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	if err != nil {
+		m.logger.Printf("daily reset limit state check failed after reset error=%v", err)
+		return
+	}
+	if _, err := m.ensureDailyLimitEmail(ctx, cfg, state); err != nil {
+		m.logger.Printf("daily reset limit email failed after reset reset_count=%d max=%d error=%v",
+			state.ResetCount, state.MaxResetCount, err)
+	}
+}
+
+func (m *Monitor) dailyResetLimitState(ctx context.Context, cfg config.Config, now time.Time) (store.DailyResetLimitState, error) {
+	if cfg.DailyMaxResetCount <= 0 {
+		return store.DailyResetLimitState{}, nil
+	}
+	return m.store.GetDailyResetLimitState(ctx, now, cfg.DailyMaxResetCount)
+}
+
+func (m *Monitor) ensureDailyLimitEmail(ctx context.Context, cfg config.Config, state store.DailyResetLimitState) (string, error) {
+	if state.MaxResetCount <= 0 || state.ResetCount < state.MaxResetCount || state.DailyLimitEmailSent {
+		return "", nil
+	}
+	subject := "今日重置次数已达到上限"
+	body := fmt.Sprintf("今日已成功重置 %d 次，已达到配置的每日最大可重置次数 %d 次。\n\n服务今日不会再执行新的重置；每日 0 点后会重新计算今日重置次数。",
+		state.ResetCount, state.MaxResetCount)
+	m.logger.Printf("daily reset limit email sending day=%s reset_count=%d max=%d recipients=%d",
+		state.Day.Format("2006-01-02"), state.ResetCount, state.MaxResetCount, len(cfg.SMTP.To))
+	if err := m.mailer.Send(ctx, subject, body); err != nil {
+		m.logger.Printf("daily reset limit email send failed day=%s reset_count=%d max=%d error=%v",
+			state.Day.Format("2006-01-02"), state.ResetCount, state.MaxResetCount, err)
+		return "daily_reset_limit_email_error", err
+	}
+	if err := m.store.MarkDailyLimitEmailSent(ctx, state.Day); err != nil {
+		return "daily_reset_limit_email_state_error", err
+	}
+	m.logger.Printf("daily reset limit email sent day=%s reset_count=%d max=%d",
+		state.Day.Format("2006-01-02"), state.ResetCount, state.MaxResetCount)
+	return "daily_reset_limit_email_sent", nil
+}
+
+func (m *Monitor) maybeSendPlanRefreshLimitEmail(ctx context.Context, balance float64, cfg config.Config, state store.DailyResetLimitState) (string, error) {
+	if state.PlanRefreshLimitEmailSent {
+		return "balance_query_paused", nil
+	}
+	subject := "已达到当前套餐可刷新上限"
+	body := fmt.Sprintf("当前余额已消费到 %.6f，且今日已达到每日最大可重置次数 %d 次。\n\n这通常表示当前套餐今日可刷新上限已达到。服务将停止查询余额，直到每日 0 点重新开启查询并刷新每日重置次数限制。",
+		balance, state.MaxResetCount)
+	m.logger.Printf("plan refresh limit email sending day=%s balance=%.6f reset_count=%d max=%d recipients=%d",
+		state.Day.Format("2006-01-02"), balance, state.ResetCount, state.MaxResetCount, len(cfg.SMTP.To))
+	if err := m.mailer.Send(ctx, subject, body); err != nil {
+		m.logger.Printf("plan refresh limit email send failed day=%s balance=%.6f reset_count=%d max=%d error=%v",
+			state.Day.Format("2006-01-02"), balance, state.ResetCount, state.MaxResetCount, err)
+		return "plan_refresh_limit_email_error", err
+	}
+	if err := m.store.MarkPlanRefreshLimitEmailSent(ctx, state.Day); err != nil {
+		return "plan_refresh_limit_email_state_error", err
+	}
+	m.pauseBalanceQueriesUntil(state.Day.AddDate(0, 0, 1))
+	m.logger.Printf("plan refresh limit email sent day=%s balance=%.6f reset_count=%d max=%d balance_query_paused=true",
+		state.Day.Format("2006-01-02"), balance, state.ResetCount, state.MaxResetCount)
+	return "plan_refresh_limit_email_sent", nil
 }
 
 func (m *Monitor) incrementManualSuccess() (int, bool, error) {
@@ -383,6 +522,7 @@ func (m *Monitor) nextPollInterval(now time.Time) time.Duration {
 func (m *Monitor) nextPollPolicy(now time.Time) pollingPolicy {
 	cfg := m.snapshot()
 	m.mu.Lock()
+	pausedUntil := m.balanceQueryPausedUntil
 	state := pollingState{
 		HasLastBalance:              m.hasLastBalance,
 		LastBalance:                 m.lastBalance,
@@ -390,7 +530,30 @@ func (m *Monitor) nextPollPolicy(now time.Time) pollingPolicy {
 		ForceFastUntilBalanceChange: m.forceFastUntilBalanceChange,
 	}
 	m.mu.Unlock()
+	if pausedUntil.After(now) {
+		interval := time.Until(pausedUntil)
+		return pollingPolicy{
+			Name:     "balance_query_pause",
+			Key:      "balance_query_pause:" + pausedUntil.Format(time.RFC3339),
+			Interval: interval,
+			Reason:   "balance query paused until daily reset",
+		}
+	}
 	return selectPollPolicy(cfg.Polling, state, now)
+}
+
+func (m *Monitor) pauseBalanceQueriesUntil(until time.Time) {
+	m.mu.Lock()
+	if until.After(m.balanceQueryPausedUntil) {
+		m.balanceQueryPausedUntil = until
+	}
+	m.mu.Unlock()
+}
+
+func (m *Monitor) clearBalanceQueryPause() {
+	m.mu.Lock()
+	m.balanceQueryPausedUntil = time.Time{}
+	m.mu.Unlock()
 }
 
 func (m *Monitor) logPollingStartup(now time.Time) {

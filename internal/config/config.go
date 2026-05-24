@@ -45,6 +45,7 @@ type Config struct {
 	BalanceJSONPath           string
 	AutoResetEnabled          bool
 	ManualConfirmSuccessCount int
+	DailyMaxResetCount        int
 	PollInterval              time.Duration
 	ConfirmTokenTTL           time.Duration
 	ResetCooldown             time.Duration
@@ -163,6 +164,7 @@ type FileResetConfig struct {
 	LowBalanceThreshold       float64 `toml:"low_balance_threshold"`
 	AutoResetEnabled          bool    `toml:"auto_reset_enabled"`
 	ManualConfirmSuccessCount int     `toml:"manual_confirm_success_count"`
+	DailyMaxResetCount        int     `toml:"daily_max_reset_count"`
 	ConfirmTokenTTL           string  `toml:"confirm_token_ttl"`
 	Cooldown                  string  `toml:"cooldown"`
 	ManualConfirmTimeRange    string  `toml:"manual_confirm_time_range"`
@@ -437,6 +439,7 @@ func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret f
 		BalanceJSONPath:           fileCfg.RayPlus.BalanceJSONPath,
 		AutoResetEnabled:          fileCfg.Reset.AutoResetEnabled,
 		ManualConfirmSuccessCount: fileCfg.Reset.ManualConfirmSuccessCount,
+		DailyMaxResetCount:        fileCfg.Reset.DailyMaxResetCount,
 		PollInterval:              parseDurationDefault(fileCfg.Polling.DefaultInterval, time.Second),
 		ConfirmTokenTTL:           parseDurationDefault(fileCfg.Reset.ConfirmTokenTTL, 24*time.Hour),
 		ResetCooldown:             parseDurationDefault(fileCfg.Reset.Cooldown, time.Minute),
@@ -517,6 +520,9 @@ func (c Config) Validate() error {
 	}
 	if c.LowBalanceThreshold <= 0 {
 		return fmt.Errorf("reset.low_balance_threshold must be greater than 0")
+	}
+	if c.DailyMaxResetCount < 0 {
+		return fmt.Errorf("reset.daily_max_reset_count must be greater than or equal to 0")
 	}
 	if c.LogRotationEnabled {
 		if strings.TrimSpace(c.LogRotationArchiveDir) == "" {

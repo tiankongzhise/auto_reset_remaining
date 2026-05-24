@@ -25,6 +25,15 @@ type ConfirmToken struct {
 	ExpiresAt time.Time
 }
 
+type DailyResetLimitState struct {
+	Day                       time.Time
+	ResetCount                int
+	MaxResetCount             int
+	DailyLimitEmailSent       bool
+	PlanRefreshLimitEmailSent bool
+	BalanceQueryPaused        bool
+}
+
 type Store interface {
 	Init(ctx context.Context) error
 	CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time) error
@@ -33,6 +42,9 @@ type Store interface {
 	ConsumeConfirmToken(ctx context.Context, tokenHash string) (ConfirmToken, error)
 	MarkConfirmTokenReset(ctx context.Context, tokenID int64, resetLogID int64, manualSuccessCountAfter int) error
 	LogReset(ctx context.Context, entry ResetLog) (int64, error)
+	GetDailyResetLimitState(ctx context.Context, day time.Time, maxResetCount int) (DailyResetLimitState, error)
+	MarkDailyLimitEmailSent(ctx context.Context, day time.Time) error
+	MarkPlanRefreshLimitEmailSent(ctx context.Context, day time.Time) error
 }
 
 type Postgres struct {
@@ -68,6 +80,11 @@ func (p *Postgres) Init(ctx context.Context) error {
 			manual_success_count_after INTEGER
 		)`,
 		`CREATE INDEX IF NOT EXISTS confirm_tokens_active_idx ON confirm_tokens (expires_at) WHERE used_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS daily_reset_limit_state (
+			day DATE PRIMARY KEY,
+			daily_limit_email_sent BOOLEAN NOT NULL DEFAULT false,
+			plan_refresh_limit_email_sent BOOLEAN NOT NULL DEFAULT false
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := p.db.ExecContext(ctx, statement); err != nil {
@@ -146,9 +163,84 @@ func (p *Postgres) LogReset(ctx context.Context, entry ResetLog) (int64, error) 
 	return id, err
 }
 
+func (p *Postgres) GetDailyResetLimitState(ctx context.Context, day time.Time, maxResetCount int) (DailyResetLimitState, error) {
+	day = truncateDay(day)
+	nextDay := day.AddDate(0, 0, 1)
+	if err := p.ensureDailyResetLimitRow(ctx, day); err != nil {
+		return DailyResetLimitState{}, err
+	}
+	var state DailyResetLimitState
+	var resetCount int
+	err := p.db.QueryRowContext(ctx,
+		`SELECT
+			COALESCE((
+				SELECT COUNT(*)
+				FROM reset_logs
+				WHERE success = true
+				  AND triggered_at >= $2
+				  AND triggered_at < $3
+			), 0),
+			daily_limit_email_sent,
+			plan_refresh_limit_email_sent
+		 FROM daily_reset_limit_state
+		 WHERE day = $1`,
+		day.Format("2006-01-02"), day, nextDay,
+	).Scan(&resetCount, &state.DailyLimitEmailSent, &state.PlanRefreshLimitEmailSent)
+	if err != nil {
+		return DailyResetLimitState{}, err
+	}
+	state.Day = day
+	state.ResetCount = resetCount
+	state.MaxResetCount = maxResetCount
+	state.BalanceQueryPaused = maxResetCount > 0 && resetCount >= maxResetCount && state.PlanRefreshLimitEmailSent
+	return state, nil
+}
+
+func (p *Postgres) MarkDailyLimitEmailSent(ctx context.Context, day time.Time) error {
+	day = truncateDay(day)
+	if err := p.ensureDailyResetLimitRow(ctx, day); err != nil {
+		return err
+	}
+	_, err := p.db.ExecContext(ctx,
+		`UPDATE daily_reset_limit_state
+		 SET daily_limit_email_sent = true
+		 WHERE day = $1`,
+		day.Format("2006-01-02"),
+	)
+	return err
+}
+
+func (p *Postgres) MarkPlanRefreshLimitEmailSent(ctx context.Context, day time.Time) error {
+	day = truncateDay(day)
+	if err := p.ensureDailyResetLimitRow(ctx, day); err != nil {
+		return err
+	}
+	_, err := p.db.ExecContext(ctx,
+		`UPDATE daily_reset_limit_state
+		 SET plan_refresh_limit_email_sent = true
+		 WHERE day = $1`,
+		day.Format("2006-01-02"),
+	)
+	return err
+}
+
+func (p *Postgres) ensureDailyResetLimitRow(ctx context.Context, day time.Time) error {
+	_, err := p.db.ExecContext(ctx,
+		`INSERT INTO daily_reset_limit_state (day)
+		 VALUES ($1)
+		 ON CONFLICT (day) DO NOTHING`,
+		truncateDay(day).Format("2006-01-02"),
+	)
+	return err
+}
+
 func nullString(value string) any {
 	if value == "" {
 		return nil
 	}
 	return value
+}
+
+func truncateDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
