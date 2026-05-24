@@ -18,6 +18,10 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/confirm-reset", func(w http.ResponseWriter, r *http.Request) {
+		if monitor == nil {
+			http.Error(w, "monitor is not configured", http.StatusServiceUnavailable)
+			return
+		}
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -35,6 +39,9 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 			if errors.Is(err, ErrDailyResetLimitReached) {
 				status = http.StatusTooManyRequests
 			}
+			if errors.Is(err, ErrResetInProgress) {
+				status = http.StatusConflict
+			}
 			http.Error(w, err.Error(), status)
 			return
 		}
@@ -43,6 +50,10 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		_, _ = w.Write([]byte(message))
 	})
 	mux.HandleFunc("/resend-reset-email", func(w http.ResponseWriter, r *http.Request) {
+		if monitor == nil {
+			http.Error(w, "monitor is not configured", http.StatusServiceUnavailable)
+			return
+		}
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -62,7 +73,79 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(result)
 	})
+	mux.HandleFunc("/manual-reset-subscription", func(w http.ResponseWriter, r *http.Request) {
+		if monitor == nil {
+			http.Error(w, "monitor is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		result, err := monitor.ManualReset(ctx, r.URL.Query().Get("key"))
+		if err != nil {
+			http.Error(w, err.Error(), manualResetHTTPStatus(err))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+	mux.HandleFunc("/test-reset-email", func(w http.ResponseWriter, r *http.Request) {
+		if monitor == nil {
+			http.Error(w, "monitor is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		result, err := monitor.TestResetEmail(ctx, r.URL.Query().Get("key"))
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, ErrTestResetEmailUnauthorized) || errors.Is(err, ErrTestResetEmailKeyMissing) {
+				status = http.StatusUnauthorized
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+	mux.HandleFunc("/cancel-reset-emails", func(w http.ResponseWriter, r *http.Request) {
+		if monitor == nil {
+			http.Error(w, "monitor is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		result, err := monitor.CancelResetEmails(ctx, r.URL.Query().Get("key"))
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, ErrCancelResetEmailUnauthorized) || errors.Is(err, ErrCancelResetEmailKeyMissing) {
+				status = http.StatusUnauthorized
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(result)
+	})
 	mux.HandleFunc("/rotate-logs", func(w http.ResponseWriter, r *http.Request) {
+		if rotator == nil {
+			http.Error(w, "log rotator is not configured", http.StatusServiceUnavailable)
+			return
+		}
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -83,4 +166,19 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		_ = json.NewEncoder(w).Encode(result)
 	})
 	return mux
+}
+
+func manualResetHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrExternalManualResetUnauthorized), errors.Is(err, ErrExternalManualResetKeyMissing):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrExternalManualResetDisabled):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrDailyResetLimitReached):
+		return http.StatusTooManyRequests
+	case errors.Is(err, ErrResetInProgress):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
 }

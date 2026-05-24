@@ -33,14 +33,18 @@ type Config struct {
 	SMTP SMTPConfig
 	PG   PGConfig
 
-	PublicBaseURL         string
-	HTTPAddr              string
-	QueryLogDir           string
-	LogRotationEnabled    bool
-	LogRotationArchiveDir string
-	LogRotationKey        string
-	ResendResetEmailKey   string
-	UserAgent             string
+	PublicBaseURL              string
+	HTTPAddr                   string
+	QueryLogDir                string
+	LogRotationEnabled         bool
+	LogRotationArchiveDir      string
+	LogRotationKey             string
+	ResendResetEmailKey        string
+	ExternalManualResetEnabled bool
+	ExternalManualResetKey     string
+	TestResetEmailKey          string
+	CancelResetEmailKey        string
+	UserAgent                  string
 
 	LowBalanceThreshold       float64
 	BalanceJSONPath           string
@@ -409,6 +413,11 @@ func tomlKey(line string) (string, bool) {
 func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret func(string) string) (Config, error) {
 	fileCfg.ApplyDefaults()
 
+	externalManualResetEnabled, err := parseBoolSecret(lookupSecret("EXTERNAL_MANUAL_RESET_ENABLED"), false, "EXTERNAL_MANUAL_RESET_ENABLED")
+	if err != nil {
+		return Config{}, err
+	}
+
 	tiers := make([]SubscriptionTier, 0, len(fileCfg.Polling.Subscription.Tiers))
 	for _, tier := range fileCfg.Polling.Subscription.Tiers {
 		tiers = append(tiers, SubscriptionTier{
@@ -421,30 +430,34 @@ func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret f
 	})
 
 	cfg := Config{
-		EnvPath:                   envPath,
-		TOMLPath:                  configPath,
-		RayPlusBaseURL:            fileCfg.RayPlus.BaseURL,
-		RayPlusAPIKey:             lookupSecret("RAYPLUS_API_KEY"),
-		RayPlusEmail:              lookupSecret("RAYPLUS_EMAIL"),
-		RayPlusPassword:           lookupSecret("RAYPLUS_PASSWORD"),
-		CodexBaseURL:              fileCfg.Codex.BaseURL,
-		SubscriptionID:            fileCfg.Codex.SubscriptionID,
-		PublicBaseURL:             strings.TrimRight(fileCfg.HTTP.PublicBaseURL, "/"),
-		HTTPAddr:                  fileCfg.HTTP.Addr,
-		QueryLogDir:               fileCfg.Logs.QueryLogDir,
-		LogRotationEnabled:        fileCfg.Logs.Rotation.Enabled,
-		LogRotationArchiveDir:     strings.TrimSpace(fileCfg.Logs.Rotation.ArchiveDir),
-		LogRotationKey:            strings.TrimSpace(lookupSecret("LOG_ROTATION_KEY")),
-		ResendResetEmailKey:       strings.TrimSpace(lookupSecret("RESEND_RESET_EMAIL_KEY")),
-		UserAgent:                 fileCfg.RayPlus.UserAgent,
-		LowBalanceThreshold:       fileCfg.Reset.LowBalanceThreshold,
-		BalanceJSONPath:           fileCfg.RayPlus.BalanceJSONPath,
-		AutoResetEnabled:          fileCfg.Reset.AutoResetEnabled,
-		ManualConfirmSuccessCount: fileCfg.Reset.ManualConfirmSuccessCount,
-		DailyMaxResetCount:        fileCfg.Reset.DailyMaxResetCount,
-		PollInterval:              parseDurationDefault(fileCfg.Polling.DefaultInterval, time.Second),
-		ConfirmTokenTTL:           parseDurationDefault(fileCfg.Reset.ConfirmTokenTTL, 24*time.Hour),
-		ResetCooldown:             parseDurationDefault(fileCfg.Reset.Cooldown, time.Minute),
+		EnvPath:                    envPath,
+		TOMLPath:                   configPath,
+		RayPlusBaseURL:             fileCfg.RayPlus.BaseURL,
+		RayPlusAPIKey:              lookupSecret("RAYPLUS_API_KEY"),
+		RayPlusEmail:               lookupSecret("RAYPLUS_EMAIL"),
+		RayPlusPassword:            lookupSecret("RAYPLUS_PASSWORD"),
+		CodexBaseURL:               fileCfg.Codex.BaseURL,
+		SubscriptionID:             fileCfg.Codex.SubscriptionID,
+		PublicBaseURL:              strings.TrimRight(fileCfg.HTTP.PublicBaseURL, "/"),
+		HTTPAddr:                   fileCfg.HTTP.Addr,
+		QueryLogDir:                fileCfg.Logs.QueryLogDir,
+		LogRotationEnabled:         fileCfg.Logs.Rotation.Enabled,
+		LogRotationArchiveDir:      strings.TrimSpace(fileCfg.Logs.Rotation.ArchiveDir),
+		LogRotationKey:             strings.TrimSpace(lookupSecret("LOG_ROTATION_KEY")),
+		ResendResetEmailKey:        strings.TrimSpace(lookupSecret("RESEND_RESET_EMAIL_KEY")),
+		ExternalManualResetEnabled: externalManualResetEnabled,
+		ExternalManualResetKey:     strings.TrimSpace(lookupSecret("EXTERNAL_MANUAL_RESET_KEY")),
+		TestResetEmailKey:          strings.TrimSpace(lookupSecret("TEST_RESET_EMAIL_KEY")),
+		CancelResetEmailKey:        strings.TrimSpace(lookupSecret("CANCEL_RESET_EMAIL_KEY")),
+		UserAgent:                  fileCfg.RayPlus.UserAgent,
+		LowBalanceThreshold:        fileCfg.Reset.LowBalanceThreshold,
+		BalanceJSONPath:            fileCfg.RayPlus.BalanceJSONPath,
+		AutoResetEnabled:           fileCfg.Reset.AutoResetEnabled,
+		ManualConfirmSuccessCount:  fileCfg.Reset.ManualConfirmSuccessCount,
+		DailyMaxResetCount:         fileCfg.Reset.DailyMaxResetCount,
+		PollInterval:               parseDurationDefault(fileCfg.Polling.DefaultInterval, time.Second),
+		ConfirmTokenTTL:            parseDurationDefault(fileCfg.Reset.ConfirmTokenTTL, 24*time.Hour),
+		ResetCooldown:              parseDurationDefault(fileCfg.Reset.Cooldown, time.Minute),
 		SMTP: SMTPConfig{
 			Host:     fileCfg.SMTP.Host,
 			Port:     fileCfg.SMTP.Port,
@@ -497,6 +510,8 @@ func (c Config) Validate() error {
 		"RAYPLUS_EMAIL":          c.RayPlusEmail,
 		"RAYPLUS_PASSWORD":       c.RayPlusPassword,
 		"RESEND_RESET_EMAIL_KEY": c.ResendResetEmailKey,
+		"TEST_RESET_EMAIL_KEY":   c.TestResetEmailKey,
+		"CANCEL_RESET_EMAIL_KEY": c.CancelResetEmailKey,
 		"rayplus.base_url":       c.RayPlusBaseURL,
 		"codex.base_url":         c.CodexBaseURL,
 		"http.public_base_url":   c.PublicBaseURL,
@@ -536,6 +551,9 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(c.LogRotationKey) == "" {
 			missing = append(missing, "LOG_ROTATION_KEY")
 		}
+	}
+	if c.ExternalManualResetEnabled && strings.TrimSpace(c.ExternalManualResetKey) == "" {
+		missing = append(missing, "EXTERNAL_MANUAL_RESET_KEY")
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("polling.default_interval must be greater than 0")
@@ -700,6 +718,18 @@ func parseIntDefault(value string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func parseBoolSecret(value string, fallback bool, key string) (bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return parsed, nil
 }
 
 func parseDurationDefault(value string, fallback time.Duration) time.Duration {

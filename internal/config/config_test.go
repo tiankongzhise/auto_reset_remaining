@@ -25,6 +25,10 @@ func TestLoadSplitsSecretsAndTOMLConfig(t *testing.T) {
 		"pg_database=auto_reset",
 		"LOG_ROTATION_KEY=secret-key",
 		"RESEND_RESET_EMAIL_KEY=resend-secret",
+		"EXTERNAL_MANUAL_RESET_ENABLED=true",
+		"EXTERNAL_MANUAL_RESET_KEY=manual-secret",
+		"TEST_RESET_EMAIL_KEY=test-secret",
+		"CANCEL_RESET_EMAIL_KEY=cancel-secret",
 	}, "\n"))
 	writeTestConfig(t, tomlPath, baseConfigTOML())
 
@@ -46,6 +50,12 @@ func TestLoadSplitsSecretsAndTOMLConfig(t *testing.T) {
 	}
 	if cfg.ResendResetEmailKey != "resend-secret" {
 		t.Fatalf("ResendResetEmailKey = %q, want resend-secret", cfg.ResendResetEmailKey)
+	}
+	if !cfg.ExternalManualResetEnabled || cfg.ExternalManualResetKey != "manual-secret" {
+		t.Fatalf("unexpected external manual reset config: enabled=%t key=%q", cfg.ExternalManualResetEnabled, cfg.ExternalManualResetKey)
+	}
+	if cfg.TestResetEmailKey != "test-secret" || cfg.CancelResetEmailKey != "cancel-secret" {
+		t.Fatalf("unexpected endpoint keys: test=%q cancel=%q", cfg.TestResetEmailKey, cfg.CancelResetEmailKey)
 	}
 	conn := cfg.PostgresConnString()
 	for _, part := range []string{"host=localhost", "port=15432", "user='pg user'", "password='pg password'", "dbname=auto_reset", "sslmode=require"} {
@@ -119,6 +129,15 @@ func TestLogRotationDisabledDoesNotRequireArchiveSettings(t *testing.T) {
 	}
 }
 
+func TestExternalManualResetEnabledRequiresKey(t *testing.T) {
+	cfg := validConfig()
+	cfg.ExternalManualResetEnabled = true
+	cfg.ExternalManualResetKey = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "EXTERNAL_MANUAL_RESET_KEY") {
+		t.Fatalf("Validate() error = %v, want EXTERNAL_MANUAL_RESET_KEY error", err)
+	}
+}
+
 func validConfig() Config {
 	return Config{
 		RayPlusBaseURL:      "https://rayplus.site",
@@ -134,6 +153,8 @@ func validConfig() Config {
 		PollInterval:        time.Second,
 		ConfirmTokenTTL:     time.Hour,
 		ResetCooldown:       time.Minute,
+		TestResetEmailKey:   "test-secret",
+		CancelResetEmailKey: "cancel-secret",
 		Polling: PollingConfig{
 			DefaultInterval:      time.Second,
 			BalanceChangeEpsilon: 0.000001,

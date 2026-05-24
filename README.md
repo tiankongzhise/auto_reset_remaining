@@ -58,6 +58,10 @@ pg_database=auto_reset_remaining
 
 LOG_ROTATION_KEY=change-this-log-rotation-key
 RESEND_RESET_EMAIL_KEY=change-this-resend-reset-email-key
+EXTERNAL_MANUAL_RESET_ENABLED=false
+EXTERNAL_MANUAL_RESET_KEY=change-this-external-manual-reset-key
+TEST_RESET_EMAIL_KEY=change-this-test-reset-email-key
+CANCEL_RESET_EMAIL_KEY=change-this-cancel-reset-email-key
 ```
 
 `config.toml` 放非敏感运行配置。重点修改这些字段：
@@ -111,6 +115,28 @@ GET /resend-reset-email?key=<RESEND_RESET_EMAIL_KEY>
 ```
 
 `RESEND_RESET_EMAIL_KEY` 来自 `.env`。key 验证成功后，服务会重新查询当前余额、发送一封新的重置确认邮件，并使之前未使用的确认链接失效。
+
+外部手动重置接口默认关闭，需同时满足 `.env` 中 `EXTERNAL_MANUAL_RESET_ENABLED=true` 且 key 正确：
+
+```text
+GET /manual-reset-subscription?key=<EXTERNAL_MANUAL_RESET_KEY>
+```
+
+执行成功后会查询当前余额、调用订阅重置接口，并发送一封邮件提示当前余额和“用户通过手动方式重置了订阅额度”。
+
+测试重置邮件接口不会真的重置订阅，但会校验 key、查询余额、写入 dry-run 日志并发送测试邮件：
+
+```text
+GET /test-reset-email?key=<TEST_RESET_EMAIL_KEY>
+```
+
+撤销未验证的重置邮件：
+
+```text
+GET /cancel-reset-emails?key=<CANCEL_RESET_EMAIL_KEY>
+```
+
+撤销后，数据库中的确认邮件记录会标记为 `manual_cancelled`；它不会再被视为待验证邮件，也不会阻塞后续正常发送新的确认邮件。
 
 ## 动态查询配置
 

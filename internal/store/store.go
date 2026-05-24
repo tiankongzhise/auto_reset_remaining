@@ -39,6 +39,7 @@ type Store interface {
 	CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time) error
 	DeleteConfirmToken(ctx context.Context, tokenHash string) error
 	DeleteOtherActiveConfirmTokens(ctx context.Context, keepTokenHash string) (int64, error)
+	CancelUnverifiedConfirmEmails(ctx context.Context) (int64, error)
 	HasActiveConfirmToken(ctx context.Context) (bool, error)
 	MarkConfirmTokenEmailSent(ctx context.Context, tokenHash string) error
 	ConsumeConfirmToken(ctx context.Context, tokenHash string) (ConfirmToken, error)
@@ -79,13 +80,28 @@ func (p *Postgres) Init(ctx context.Context) error {
 			email_sent_at TIMESTAMPTZ,
 			expires_at TIMESTAMPTZ NOT NULL,
 			used_at TIMESTAMPTZ,
+			cancelled_at TIMESTAMPTZ,
+			status TEXT NOT NULL DEFAULT 'created',
 			reset_log_id BIGINT REFERENCES reset_logs(id),
 			manual_success_count_after INTEGER
 		)`,
 		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS email_sent_at TIMESTAMPTZ`,
+		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`,
+		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS status TEXT`,
+		`UPDATE confirm_tokens
+		 SET status = CASE
+			WHEN reset_log_id IS NOT NULL THEN 'reset'
+			WHEN used_at IS NOT NULL THEN 'used'
+			WHEN email_sent_at IS NOT NULL AND expires_at > now() THEN 'email_sent'
+			WHEN email_sent_at IS NOT NULL THEN 'expired'
+			ELSE 'created'
+		 END
+		 WHERE status IS NULL OR status = ''`,
+		`ALTER TABLE confirm_tokens ALTER COLUMN status SET DEFAULT 'created'`,
+		`ALTER TABLE confirm_tokens ALTER COLUMN status SET NOT NULL`,
 		`DELETE FROM confirm_tokens WHERE used_at IS NULL AND email_sent_at IS NULL`,
 		`DROP INDEX IF EXISTS confirm_tokens_active_idx`,
-		`CREATE INDEX IF NOT EXISTS confirm_tokens_active_idx ON confirm_tokens (expires_at) WHERE used_at IS NULL AND email_sent_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS confirm_tokens_active_idx ON confirm_tokens (expires_at) WHERE used_at IS NULL AND email_sent_at IS NOT NULL AND status = 'email_sent'`,
 		`CREATE TABLE IF NOT EXISTS daily_reset_limit_state (
 			day DATE PRIMARY KEY,
 			daily_limit_email_sent BOOLEAN NOT NULL DEFAULT false,
@@ -118,13 +134,27 @@ func (p *Postgres) DeleteOtherActiveConfirmTokens(ctx context.Context, keepToken
 	err := p.db.QueryRowContext(ctx,
 		`WITH deleted AS (
 			DELETE FROM confirm_tokens
-			 WHERE used_at IS NULL AND expires_at > now() AND token_hash <> $1
+			 WHERE used_at IS NULL AND status = 'email_sent' AND expires_at > now() AND token_hash <> $1
 			 RETURNING email_sent_at
 		 )
 		 SELECT COUNT(*) FROM deleted WHERE email_sent_at IS NOT NULL`,
 		keepTokenHash,
 	).Scan(&invalidated)
 	return invalidated, err
+}
+
+func (p *Postgres) CancelUnverifiedConfirmEmails(ctx context.Context) (int64, error) {
+	result, err := p.db.ExecContext(ctx,
+		`UPDATE confirm_tokens
+		 SET status = 'manual_cancelled', cancelled_at = now()
+		 WHERE email_sent_at IS NOT NULL
+		   AND used_at IS NULL
+		   AND status = 'email_sent'`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (p *Postgres) HasActiveConfirmToken(ctx context.Context) (bool, error) {
@@ -134,6 +164,7 @@ func (p *Postgres) HasActiveConfirmToken(ctx context.Context) (bool, error) {
 			SELECT 1 FROM confirm_tokens
 			WHERE email_sent_at IS NOT NULL
 			  AND used_at IS NULL
+			  AND status = 'email_sent'
 			  AND expires_at > now()
 		)`,
 	).Scan(&exists)
@@ -143,8 +174,8 @@ func (p *Postgres) HasActiveConfirmToken(ctx context.Context) (bool, error) {
 func (p *Postgres) MarkConfirmTokenEmailSent(ctx context.Context, tokenHash string) error {
 	result, err := p.db.ExecContext(ctx,
 		`UPDATE confirm_tokens
-		 SET email_sent_at = now()
-		 WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`,
+		 SET email_sent_at = now(), status = 'email_sent'
+		 WHERE token_hash = $1 AND used_at IS NULL AND status = 'created' AND expires_at > now()`,
 		tokenHash,
 	)
 	if err != nil {
@@ -164,10 +195,11 @@ func (p *Postgres) ConsumeConfirmToken(ctx context.Context, tokenHash string) (C
 	var token ConfirmToken
 	err := p.db.QueryRowContext(ctx,
 		`UPDATE confirm_tokens
-		 SET used_at = now()
+		 SET used_at = now(), status = 'used'
 		 WHERE token_hash = $1
 		   AND email_sent_at IS NOT NULL
 		   AND used_at IS NULL
+		   AND status = 'email_sent'
 		   AND expires_at > now()
 		 RETURNING id, balance, expires_at`,
 		tokenHash,
@@ -181,7 +213,7 @@ func (p *Postgres) ConsumeConfirmToken(ctx context.Context, tokenHash string) (C
 func (p *Postgres) MarkConfirmTokenReset(ctx context.Context, tokenID int64, resetLogID int64, manualSuccessCountAfter int) error {
 	_, err := p.db.ExecContext(ctx,
 		`UPDATE confirm_tokens
-		 SET reset_log_id = $2, manual_success_count_after = $3
+		 SET reset_log_id = $2, manual_success_count_after = $3, status = 'reset'
 		 WHERE id = $1`,
 		tokenID, resetLogID, manualSuccessCountAfter,
 	)

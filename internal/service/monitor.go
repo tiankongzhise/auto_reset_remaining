@@ -24,9 +24,17 @@ import (
 )
 
 var (
-	ErrDailyResetLimitReached = errors.New("daily reset limit reached")
-	ErrResendUnauthorized     = errors.New("invalid resend reset email key")
-	ErrResendKeyMissing       = errors.New("resend reset email key is not configured")
+	ErrDailyResetLimitReached          = errors.New("daily reset limit reached")
+	ErrResendUnauthorized              = errors.New("invalid resend reset email key")
+	ErrResendKeyMissing                = errors.New("resend reset email key is not configured")
+	ErrExternalManualResetDisabled     = errors.New("external manual reset is disabled")
+	ErrExternalManualResetUnauthorized = errors.New("invalid external manual reset key")
+	ErrExternalManualResetKeyMissing   = errors.New("external manual reset key is not configured")
+	ErrTestResetEmailUnauthorized      = errors.New("invalid test reset email key")
+	ErrTestResetEmailKeyMissing        = errors.New("test reset email key is not configured")
+	ErrCancelResetEmailUnauthorized    = errors.New("invalid cancel reset email key")
+	ErrCancelResetEmailKeyMissing      = errors.New("cancel reset email key is not configured")
+	ErrResetInProgress                 = errors.New("subscription reset is already in progress")
 )
 
 type APIClient interface {
@@ -71,6 +79,26 @@ type ResendConfirmEmailResult struct {
 	InvalidatedOldLinks int64     `json:"invalidated_old_links"`
 	Status              string    `json:"status"`
 	NextPollInterval    string    `json:"next_poll_interval,omitempty"`
+}
+
+type ManualResetResult struct {
+	Balance        float64 `json:"balance"`
+	SubscriptionID int64   `json:"subscription_id,omitempty"`
+	ResetLogID     int64   `json:"reset_log_id,omitempty"`
+	EmailSent      bool    `json:"email_sent"`
+	Status         string  `json:"status"`
+}
+
+type TestResetEmailResult struct {
+	Balance      float64 `json:"balance"`
+	EmailSent    bool    `json:"email_sent"`
+	ResetSkipped bool    `json:"reset_skipped"`
+	Status       string  `json:"status"`
+}
+
+type CancelResetEmailResult struct {
+	Cancelled int64  `json:"cancelled"`
+	Status    string `json:"status"`
 }
 
 func NewMonitor(cfg config.Config, envPath string, apiClient APIClient, sender mailer.Sender, dataStore store.Store, queries *QueryLogger, logger *log.Logger) *Monitor {
@@ -281,12 +309,9 @@ func (m *Monitor) ResendConfirmEmail(ctx context.Context, key string) (ResendCon
 		m.logger.Printf("resend confirm email config refresh failed error=%v", refreshErr)
 		cfg = m.snapshot()
 	}
-	if !validSharedKey(cfg.ResendResetEmailKey, key) {
+	if err := requireSharedKey(cfg.ResendResetEmailKey, key, ErrResendKeyMissing, ErrResendUnauthorized); err != nil {
 		m.logger.Print("resend confirm email rejected reason=invalid_key")
-		if strings.TrimSpace(cfg.ResendResetEmailKey) == "" {
-			return ResendConfirmEmailResult{}, ErrResendKeyMissing
-		}
-		return ResendConfirmEmailResult{}, ErrResendUnauthorized
+		return ResendConfirmEmailResult{}, err
 	}
 
 	result, err := m.api.QueryBalance(ctx)
@@ -303,6 +328,120 @@ func (m *Monitor) ResendConfirmEmail(ctx context.Context, key string) (ResendCon
 	m.logger.Printf("resend confirm email succeeded balance=%.6f expires_at=%s invalidated_old_links=%d",
 		sendResult.Balance, sendResult.ExpiresAt.Format(time.RFC3339), sendResult.InvalidatedOldLinks)
 	return sendResult, nil
+}
+
+func (m *Monitor) ManualReset(ctx context.Context, key string) (ManualResetResult, error) {
+	cfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("external manual reset config refresh failed error=%v", refreshErr)
+		cfg = m.snapshot()
+	}
+	if !cfg.ExternalManualResetEnabled {
+		m.logger.Print("external manual reset rejected reason=disabled")
+		return ManualResetResult{}, ErrExternalManualResetDisabled
+	}
+	if err := requireSharedKey(cfg.ExternalManualResetKey, key, ErrExternalManualResetKeyMissing, ErrExternalManualResetUnauthorized); err != nil {
+		m.logger.Print("external manual reset rejected reason=invalid_key")
+		return ManualResetResult{}, err
+	}
+
+	result, err := m.api.QueryBalance(ctx)
+	if err != nil {
+		m.logger.Printf("external manual reset balance query failed error=%v", err)
+		return ManualResetResult{}, err
+	}
+	m.observeBalance(time.Now(), result.Balance)
+
+	if err := m.ensureResetAllowed(ctx, cfg, "external manual reset"); err != nil {
+		return ManualResetResult{Balance: result.Balance, Status: "external_manual_reset_rejected"}, err
+	}
+
+	resetResult, resetLogID, err := m.executeResetIfIdle(ctx, "external_manual", result.Balance)
+	if err != nil {
+		return ManualResetResult{Balance: result.Balance, Status: "external_manual_reset_error"}, err
+	}
+	if err := m.sendManualResetNotification(ctx, cfg, result.Balance, resetResult.SubscriptionID, resetLogID, false); err != nil {
+		m.logger.Printf("external manual reset notification failed balance=%.6f subscription_id=%d reset_log_id=%d error=%v",
+			result.Balance, resetResult.SubscriptionID, resetLogID, err)
+		return ManualResetResult{
+			Balance:        result.Balance,
+			SubscriptionID: resetResult.SubscriptionID,
+			ResetLogID:     resetLogID,
+			Status:         "external_manual_reset_email_error",
+		}, err
+	}
+	m.logger.Printf("external manual reset succeeded balance=%.6f subscription_id=%d reset_log_id=%d",
+		result.Balance, resetResult.SubscriptionID, resetLogID)
+	return ManualResetResult{
+		Balance:        result.Balance,
+		SubscriptionID: resetResult.SubscriptionID,
+		ResetLogID:     resetLogID,
+		EmailSent:      true,
+		Status:         "external_manual_reset_success",
+	}, nil
+}
+
+func (m *Monitor) TestResetEmail(ctx context.Context, key string) (TestResetEmailResult, error) {
+	cfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("test reset email config refresh failed error=%v", refreshErr)
+		cfg = m.snapshot()
+	}
+	if err := requireSharedKey(cfg.TestResetEmailKey, key, ErrTestResetEmailKeyMissing, ErrTestResetEmailUnauthorized); err != nil {
+		m.logger.Print("test reset email rejected reason=invalid_key")
+		return TestResetEmailResult{}, err
+	}
+
+	result, err := m.api.QueryBalance(ctx)
+	if err != nil {
+		m.logger.Printf("test reset email balance query failed error=%v", err)
+		return TestResetEmailResult{}, err
+	}
+	m.observeBalance(time.Now(), result.Balance)
+
+	if _, err := m.store.LogReset(ctx, store.ResetLog{
+		Mode:            "external_manual_test",
+		Balance:         result.Balance,
+		Success:         false,
+		ResponseSummary: "test reset email dry run: reset skipped",
+	}); err != nil {
+		m.logger.Printf("test reset email dry-run log failed balance=%.6f error=%v", result.Balance, err)
+		return TestResetEmailResult{Balance: result.Balance, ResetSkipped: true, Status: "test_reset_email_log_error"}, err
+	}
+
+	if err := m.sendManualResetNotification(ctx, cfg, result.Balance, 0, 0, true); err != nil {
+		m.logger.Printf("test reset email send failed balance=%.6f error=%v", result.Balance, err)
+		return TestResetEmailResult{Balance: result.Balance, ResetSkipped: true, Status: "test_reset_email_error"}, err
+	}
+	m.logger.Printf("test reset email succeeded balance=%.6f", result.Balance)
+	return TestResetEmailResult{
+		Balance:      result.Balance,
+		EmailSent:    true,
+		ResetSkipped: true,
+		Status:       "test_reset_email_sent",
+	}, nil
+}
+
+func (m *Monitor) CancelResetEmails(ctx context.Context, key string) (CancelResetEmailResult, error) {
+	cfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("cancel reset emails config refresh failed error=%v", refreshErr)
+		cfg = m.snapshot()
+	}
+	if err := requireSharedKey(cfg.CancelResetEmailKey, key, ErrCancelResetEmailKeyMissing, ErrCancelResetEmailUnauthorized); err != nil {
+		m.logger.Print("cancel reset emails rejected reason=invalid_key")
+		return CancelResetEmailResult{}, err
+	}
+	cancelled, err := m.store.CancelUnverifiedConfirmEmails(ctx)
+	if err != nil {
+		m.logger.Printf("cancel reset emails failed error=%v", err)
+		return CancelResetEmailResult{}, err
+	}
+	m.mu.Lock()
+	m.pendingManualEmail = false
+	m.mu.Unlock()
+	m.logger.Printf("cancel reset emails succeeded cancelled=%d", cancelled)
+	return CancelResetEmailResult{Cancelled: cancelled, Status: "reset_emails_cancelled"}, nil
 }
 
 func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg config.Config, statusPrefix string) (ResendConfirmEmailResult, error) {
@@ -373,33 +512,55 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 
 func (m *Monitor) maybeAutoReset(ctx context.Context, balance float64, cooldown time.Duration) (string, error) {
 	now := time.Now()
-	m.mu.Lock()
-	if m.resetInFlight {
-		m.mu.Unlock()
-		m.logger.Printf("auto reset skipped balance=%.6f reason=in_progress", balance)
-		return "auto_reset_in_progress", nil
-	}
-	if cooldown > 0 && !m.lastAutoReset.IsZero() && now.Sub(m.lastAutoReset) < cooldown {
-		remaining := cooldown - now.Sub(m.lastAutoReset)
-		m.mu.Unlock()
-		m.logger.Printf("auto reset skipped balance=%.6f reason=cooldown remaining=%s", balance, remaining.Round(time.Second))
-		return "auto_reset_cooldown", nil
-	}
-	m.resetInFlight = true
-	m.lastAutoReset = now
-	m.mu.Unlock()
-
-	defer func() {
+	if cooldown > 0 {
 		m.mu.Lock()
-		m.resetInFlight = false
+		lastAutoReset := m.lastAutoReset
 		m.mu.Unlock()
-	}()
+		if !lastAutoReset.IsZero() && now.Sub(lastAutoReset) < cooldown {
+			remaining := cooldown - now.Sub(lastAutoReset)
+			m.logger.Printf("auto reset skipped balance=%.6f reason=cooldown remaining=%s", balance, remaining.Round(time.Second))
+			return "auto_reset_cooldown", nil
+		}
+	}
 
-	_, _, err := m.executeReset(ctx, "auto", balance)
+	_, _, err := m.executeResetIfIdle(ctx, "auto", balance)
 	if err != nil {
+		if errors.Is(err, ErrResetInProgress) {
+			m.logger.Printf("auto reset skipped balance=%.6f reason=in_progress", balance)
+			return "auto_reset_in_progress", nil
+		}
 		return "auto_reset_error", err
 	}
 	return "auto_reset_success", nil
+}
+
+func (m *Monitor) executeResetIfIdle(ctx context.Context, mode string, balance float64) (api.ResetResult, int64, error) {
+	if !m.beginReset(mode) {
+		return api.ResetResult{}, 0, ErrResetInProgress
+	}
+	defer m.finishReset()
+
+	return m.executeReset(ctx, mode, balance)
+}
+
+func (m *Monitor) beginReset(mode string) bool {
+	m.mu.Lock()
+	if m.resetInFlight {
+		m.mu.Unlock()
+		return false
+	}
+	m.resetInFlight = true
+	if mode == "auto" {
+		m.lastAutoReset = time.Now()
+	}
+	m.mu.Unlock()
+	return true
+}
+
+func (m *Monitor) finishReset() {
+	m.mu.Lock()
+	m.resetInFlight = false
+	m.mu.Unlock()
 }
 
 func (m *Monitor) Confirm(ctx context.Context, rawToken string) (ConfirmResult, error) {
@@ -427,6 +588,12 @@ func (m *Monitor) Confirm(ctx context.Context, rawToken string) (ConfirmResult, 
 			tokenPrefix, state.ResetCount, state.MaxResetCount)
 		return ConfirmResult{}, ErrDailyResetLimitReached
 	}
+
+	if !m.beginReset("manual") {
+		m.logger.Printf("confirm reset URL rejected token_hash_prefix=%s reason=in_progress", tokenPrefix)
+		return ConfirmResult{}, ErrResetInProgress
+	}
+	defer m.finishReset()
 
 	token, err := m.store.ConsumeConfirmToken(ctx, tokenHash)
 	if err != nil {
@@ -498,6 +665,42 @@ func (m *Monitor) executeReset(ctx context.Context, mode string, balance float64
 		mode, balance, result.SubscriptionID, result.HTTPStatus, resetLogID, result.ResponseSummary)
 	m.notifyDailyLimitAfterReset(ctx)
 	return result, resetLogID, nil
+}
+
+func (m *Monitor) ensureResetAllowed(ctx context.Context, cfg config.Config, event string) error {
+	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	if err != nil {
+		m.logger.Printf("%s rejected reason=daily_limit_state_error error=%v", event, err)
+		return err
+	}
+	if state.MaxResetCount > 0 && state.ResetCount >= state.MaxResetCount {
+		if _, err := m.ensureDailyLimitEmail(ctx, cfg, state); err != nil {
+			m.logger.Printf("%s rejected reason=daily_limit_email_error error=%v", event, err)
+			return err
+		}
+		m.logger.Printf("%s rejected reason=daily_limit_reached reset_count=%d max=%d", event, state.ResetCount, state.MaxResetCount)
+		return ErrDailyResetLimitReached
+	}
+	return nil
+}
+
+func (m *Monitor) sendManualResetNotification(ctx context.Context, cfg config.Config, balance float64, subscriptionID int64, resetLogID int64, dryRun bool) error {
+	freshCfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("manual reset notification config refresh failed dry_run=%t error=%v", dryRun, refreshErr)
+	} else {
+		cfg = freshCfg
+	}
+
+	if dryRun {
+		subject := "测试：手动重置订阅额度邮件"
+		body := fmt.Sprintf("这是一封测试邮件，系统已经完成密钥校验、余额查询、日志记录和邮件发送链路校验，但不会真的重置订阅额度。\n\n当前余额：%.6f\n触发方式：测试接口\n", balance)
+		return m.mailer.Send(ctx, subject, body)
+	}
+
+	subject := "订阅额度已通过手动方式重置"
+	body := fmt.Sprintf("当前余额：%.6f\n\n用户通过手动方式重置了订阅额度。\n订阅 ID：%d\n重置日志 ID：%d\n", balance, subscriptionID, resetLogID)
+	return m.mailer.Send(ctx, subject, body)
 }
 
 func (m *Monitor) notifyDailyLimitAfterReset(ctx context.Context) {
@@ -880,4 +1083,14 @@ func validSharedKey(configured string, provided string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(configured)) == 1
+}
+
+func requireSharedKey(configured string, provided string, missingErr error, unauthorizedErr error) error {
+	if validSharedKey(configured, provided) {
+		return nil
+	}
+	if strings.TrimSpace(configured) == "" {
+		return missingErr
+	}
+	return unauthorizedErr
 }

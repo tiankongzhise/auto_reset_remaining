@@ -161,6 +161,135 @@ func TestResendConfirmEmailRejectsWrongKey(t *testing.T) {
 	}
 }
 
+func TestManualResetRequiresEnabledAndKeyThenSendsNotification(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.37, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ExternalManualResetEnabled: true,
+		ExternalManualResetKey:     "manual-secret",
+	})
+
+	_, err := monitor.ManualReset(ctx, "wrong")
+	if !errors.Is(err, ErrExternalManualResetUnauthorized) {
+		t.Fatalf("ManualReset(wrong key) error = %v, want ErrExternalManualResetUnauthorized", err)
+	}
+	if apiClient.balanceCalls != 0 || apiClient.resetCalls != 0 || len(sender.messages) != 0 {
+		t.Fatalf("wrong key touched chain: balance=%d reset=%d messages=%d", apiClient.balanceCalls, apiClient.resetCalls, len(sender.messages))
+	}
+
+	result, err := monitor.ManualReset(ctx, "manual-secret")
+	if err != nil {
+		t.Fatalf("ManualReset() error = %v", err)
+	}
+	if result.Status != "external_manual_reset_success" || !result.EmailSent {
+		t.Fatalf("ManualReset() result = %+v", result)
+	}
+	if apiClient.balanceCalls != 1 || apiClient.resetCalls != 1 {
+		t.Fatalf("calls balance=%d reset=%d, want 1/1", apiClient.balanceCalls, apiClient.resetCalls)
+	}
+	if got := len(dataStore.resetLogs); got != 1 || dataStore.resetLogs[0].Mode != "external_manual" || !dataStore.resetLogs[0].Success {
+		t.Fatalf("reset logs = %+v", dataStore.resetLogs)
+	}
+	if got := len(sender.messages); got != 1 || !strings.Contains(sender.messages[0], "用户通过手动方式重置了订阅额度") || !strings.Contains(sender.messages[0], "0.370000") {
+		t.Fatalf("manual reset notification = %q", sender.messages)
+	}
+}
+
+func TestManualResetRejectsWhenDisabled(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.37}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ExternalManualResetKey: "manual-secret",
+	})
+
+	_, err := monitor.ManualReset(ctx, "manual-secret")
+	if !errors.Is(err, ErrExternalManualResetDisabled) {
+		t.Fatalf("ManualReset() error = %v, want ErrExternalManualResetDisabled", err)
+	}
+	if apiClient.balanceCalls != 0 || apiClient.resetCalls != 0 || len(sender.messages) != 0 {
+		t.Fatalf("disabled reset touched chain: balance=%d reset=%d messages=%d", apiClient.balanceCalls, apiClient.resetCalls, len(sender.messages))
+	}
+}
+
+func TestTestResetEmailValidatesChainWithoutReset(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.25, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		TestResetEmailKey: "test-secret",
+	})
+
+	_, err := monitor.TestResetEmail(ctx, "wrong")
+	if !errors.Is(err, ErrTestResetEmailUnauthorized) {
+		t.Fatalf("TestResetEmail(wrong key) error = %v, want ErrTestResetEmailUnauthorized", err)
+	}
+	if apiClient.balanceCalls != 0 || len(sender.messages) != 0 {
+		t.Fatalf("wrong key touched chain: balance=%d messages=%d", apiClient.balanceCalls, len(sender.messages))
+	}
+
+	result, err := monitor.TestResetEmail(ctx, "test-secret")
+	if err != nil {
+		t.Fatalf("TestResetEmail() error = %v", err)
+	}
+	if result.Status != "test_reset_email_sent" || !result.EmailSent || !result.ResetSkipped {
+		t.Fatalf("TestResetEmail() result = %+v", result)
+	}
+	if apiClient.balanceCalls != 1 {
+		t.Fatalf("balanceCalls = %d, want 1", apiClient.balanceCalls)
+	}
+	if apiClient.resetCalls != 0 {
+		t.Fatalf("resetCalls = %d, want 0", apiClient.resetCalls)
+	}
+	if got := len(dataStore.resetLogs); got != 1 || dataStore.resetLogs[0].Mode != "external_manual_test" || dataStore.resetLogs[0].Success {
+		t.Fatalf("dry-run reset logs = %+v", dataStore.resetLogs)
+	}
+	if got := len(sender.messages); got != 1 || !strings.Contains(sender.messages[0], "这是一封测试邮件") || !strings.Contains(sender.messages[0], "不会真的重置订阅额度") {
+		t.Fatalf("test reset email = %q", sender.messages)
+	}
+}
+
+func TestCancelResetEmailsMarksManualCancelledAndDoesNotBlockFlow(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		CancelResetEmailKey: "cancel-secret",
+	})
+
+	if status, err := monitor.Tick(ctx); err != nil || status != "low_balance_email_sent" {
+		t.Fatalf("Tick() status=%s err=%v", status, err)
+	}
+	oldToken := extractToken(t, sender.messages[0])
+
+	result, err := monitor.CancelResetEmails(ctx, "cancel-secret")
+	if err != nil {
+		t.Fatalf("CancelResetEmails() error = %v", err)
+	}
+	if result.Cancelled != 1 || result.Status != "reset_emails_cancelled" {
+		t.Fatalf("CancelResetEmails() = %+v, want one cancelled", result)
+	}
+	if _, err := monitor.Confirm(ctx, oldToken); !errors.Is(err, store.ErrTokenInvalid) {
+		t.Fatalf("Confirm(cancelled token) error = %v, want ErrTokenInvalid", err)
+	}
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() after cancel error = %v", err)
+	}
+	if status != "low_balance_email_sent" {
+		t.Fatalf("Tick() after cancel status = %s, want low_balance_email_sent", status)
+	}
+	if got := len(sender.messages); got != 2 {
+		t.Fatalf("sent messages after cancel = %d, want 2", got)
+	}
+}
+
 func TestResendConfirmEmailRefreshesSMTPConfigFromTOML(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -487,16 +616,20 @@ func newTestMonitor(t *testing.T, apiClient *fakeAPI, sender *fakeMailer, dataSt
 	t.Helper()
 	configPath := writeConfig(t, overrides.ManualConfirmSuccessCount, overrides.AutoResetEnabled)
 	cfg := config.Config{
-		TOMLPath:                  configPath,
-		PublicBaseURL:             "https://service.example.com",
-		LowBalanceThreshold:       0.5,
-		ConfirmTokenTTL:           time.Hour,
-		PollInterval:              time.Second,
-		QueryLogDir:               filepath.Join(t.TempDir(), "logs"),
-		ResendResetEmailKey:       overrides.ResendResetEmailKey,
-		ManualConfirmSuccessCount: 0,
-		AutoResetEnabled:          false,
-		ResetCooldown:             time.Minute,
+		TOMLPath:                   configPath,
+		PublicBaseURL:              "https://service.example.com",
+		LowBalanceThreshold:        0.5,
+		ConfirmTokenTTL:            time.Hour,
+		PollInterval:               time.Second,
+		QueryLogDir:                filepath.Join(t.TempDir(), "logs"),
+		ResendResetEmailKey:        overrides.ResendResetEmailKey,
+		ExternalManualResetEnabled: overrides.ExternalManualResetEnabled,
+		ExternalManualResetKey:     overrides.ExternalManualResetKey,
+		TestResetEmailKey:          overrides.TestResetEmailKey,
+		CancelResetEmailKey:        overrides.CancelResetEmailKey,
+		ManualConfirmSuccessCount:  0,
+		AutoResetEnabled:           false,
+		ResetCooldown:              time.Minute,
 		Polling: config.PollingConfig{
 			DefaultInterval:      time.Second,
 			BalanceChangeEpsilon: 0.000001,
@@ -547,6 +680,10 @@ func writeServiceEnv(t *testing.T, path string) {
 		"pg_database=auto_reset",
 		"LOG_ROTATION_KEY=secret-key",
 		"RESEND_RESET_EMAIL_KEY=resend-secret",
+		"EXTERNAL_MANUAL_RESET_ENABLED=true",
+		"EXTERNAL_MANUAL_RESET_KEY=manual-secret",
+		"TEST_RESET_EMAIL_KEY=test-secret",
+		"CANCEL_RESET_EMAIL_KEY=cancel-secret",
 	}, "\n")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -705,6 +842,7 @@ type fakeToken struct {
 	expiresAt time.Time
 	used      bool
 	emailSent bool
+	cancelled bool
 }
 
 func newFakeStore() *fakeStore {
@@ -730,21 +868,32 @@ func (f *fakeStore) DeleteOtherActiveConfirmTokens(_ context.Context, keepTokenH
 	var deleted int64
 	now := time.Now()
 	for tokenHash, token := range f.tokens {
-		if tokenHash == keepTokenHash || token.used || !token.expiresAt.After(now) {
+		if tokenHash == keepTokenHash || token.used || token.cancelled || !token.emailSent || !token.expiresAt.After(now) {
 			continue
 		}
 		delete(f.tokens, tokenHash)
-		if token.emailSent {
-			deleted++
-		}
+		deleted++
 	}
 	return deleted, nil
+}
+
+func (f *fakeStore) CancelUnverifiedConfirmEmails(context.Context) (int64, error) {
+	var cancelled int64
+	for tokenHash, token := range f.tokens {
+		if !token.emailSent || token.used || token.cancelled {
+			continue
+		}
+		token.cancelled = true
+		f.tokens[tokenHash] = token
+		cancelled++
+	}
+	return cancelled, nil
 }
 
 func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
 	now := time.Now()
 	for _, token := range f.tokens {
-		if token.emailSent && !token.used && token.expiresAt.After(now) {
+		if token.emailSent && !token.used && !token.cancelled && token.expiresAt.After(now) {
 			return true, nil
 		}
 	}
@@ -753,7 +902,7 @@ func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
 
 func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash string) error {
 	token, ok := f.tokens[tokenHash]
-	if !ok || token.used || token.expiresAt.Before(time.Now()) {
+	if !ok || token.used || token.cancelled || token.expiresAt.Before(time.Now()) {
 		return store.ErrTokenInvalid
 	}
 	token.emailSent = true
@@ -763,7 +912,7 @@ func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash strin
 
 func (f *fakeStore) ConsumeConfirmToken(_ context.Context, tokenHash string) (store.ConfirmToken, error) {
 	token, ok := f.tokens[tokenHash]
-	if !ok || !token.emailSent || token.used || token.expiresAt.Before(time.Now()) {
+	if !ok || !token.emailSent || token.used || token.cancelled || token.expiresAt.Before(time.Now()) {
 		return store.ConfirmToken{}, store.ErrTokenInvalid
 	}
 	token.used = true
