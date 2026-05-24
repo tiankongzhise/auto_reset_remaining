@@ -57,6 +57,7 @@ pg_password=postgres-password
 pg_database=auto_reset_remaining
 
 LOG_ROTATION_KEY=change-this-log-rotation-key
+RESEND_RESET_EMAIL_KEY=change-this-resend-reset-email-key
 ```
 
 `config.toml` 放非敏感运行配置。重点修改这些字段：
@@ -102,6 +103,14 @@ GET /healthz
 ```text
 GET /confirm-reset?token=<token>
 ```
+
+如果自动发送确认邮件失败，或需要让旧确认链接作废并重新发送一封确认邮件，可以调用补发接口：
+
+```text
+GET /resend-reset-email?key=<RESEND_RESET_EMAIL_KEY>
+```
+
+`RESEND_RESET_EMAIL_KEY` 来自 `.env`。key 验证成功后，服务会重新查询当前余额、发送一封新的重置确认邮件，并使之前未使用的确认链接失效。
 
 ## 动态查询配置
 

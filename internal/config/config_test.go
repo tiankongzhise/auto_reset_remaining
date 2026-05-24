@@ -24,6 +24,7 @@ func TestLoadSplitsSecretsAndTOMLConfig(t *testing.T) {
 		"pg_password=pg password",
 		"pg_database=auto_reset",
 		"LOG_ROTATION_KEY=secret-key",
+		"RESEND_RESET_EMAIL_KEY=resend-secret",
 	}, "\n"))
 	writeTestConfig(t, tomlPath, baseConfigTOML())
 
@@ -42,6 +43,9 @@ func TestLoadSplitsSecretsAndTOMLConfig(t *testing.T) {
 	}
 	if cfg.LogRotationEnabled || cfg.LogRotationKey != "secret-key" {
 		t.Fatalf("unexpected log rotation config: enabled=%t key=%q", cfg.LogRotationEnabled, cfg.LogRotationKey)
+	}
+	if cfg.ResendResetEmailKey != "resend-secret" {
+		t.Fatalf("ResendResetEmailKey = %q, want resend-secret", cfg.ResendResetEmailKey)
 	}
 	conn := cfg.PostgresConnString()
 	for _, part := range []string{"host=localhost", "port=15432", "user='pg user'", "password='pg password'", "dbname=auto_reset", "sslmode=require"} {
@@ -125,6 +129,7 @@ func validConfig() Config {
 		PublicBaseURL:       "https://service.example.com",
 		HTTPAddr:            "127.0.0.1:8080",
 		QueryLogDir:         "logs",
+		ResendResetEmailKey: "resend-secret",
 		LowBalanceThreshold: 0.5,
 		PollInterval:        time.Second,
 		ConfirmTokenTTL:     time.Hour,

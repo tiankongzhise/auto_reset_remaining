@@ -97,6 +97,67 @@ func TestConfirmClearsPendingEmail(t *testing.T) {
 	}
 }
 
+func TestResendConfirmEmailInvalidatesOldConfirmURL(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ResendResetEmailKey: "resend-secret",
+	})
+
+	if status, err := monitor.Tick(ctx); err != nil || status != "low_balance_email_sent" {
+		t.Fatalf("Tick() status=%s err=%v", status, err)
+	}
+	oldToken := extractToken(t, sender.messages[0])
+
+	result, err := monitor.ResendConfirmEmail(ctx, "resend-secret")
+	if err != nil {
+		t.Fatalf("ResendConfirmEmail() error = %v", err)
+	}
+	if result.Status != "resend_confirm_email_sent" {
+		t.Fatalf("ResendConfirmEmail() status = %s", result.Status)
+	}
+	if result.InvalidatedOldLinks != 1 {
+		t.Fatalf("InvalidatedOldLinks = %d, want 1", result.InvalidatedOldLinks)
+	}
+	if len(sender.messages) != 2 {
+		t.Fatalf("sent messages = %d, want 2", len(sender.messages))
+	}
+	newToken := extractToken(t, sender.messages[1])
+	if newToken == oldToken {
+		t.Fatal("resend reused the old confirm token")
+	}
+
+	if _, err := monitor.Confirm(ctx, oldToken); !errors.Is(err, store.ErrTokenInvalid) {
+		t.Fatalf("Confirm(oldToken) error = %v, want ErrTokenInvalid", err)
+	}
+	if _, err := monitor.Confirm(ctx, newToken); err != nil {
+		t.Fatalf("Confirm(newToken) error = %v", err)
+	}
+}
+
+func TestResendConfirmEmailRejectsWrongKey(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ResendResetEmailKey: "resend-secret",
+	})
+
+	_, err := monitor.ResendConfirmEmail(ctx, "wrong")
+	if !errors.Is(err, ErrResendUnauthorized) {
+		t.Fatalf("ResendConfirmEmail() error = %v, want ErrResendUnauthorized", err)
+	}
+	if apiClient.balanceCalls != 0 {
+		t.Fatalf("balanceCalls = %d, want 0", apiClient.balanceCalls)
+	}
+	if len(sender.messages) != 0 {
+		t.Fatalf("sent messages = %d, want 0", len(sender.messages))
+	}
+}
+
 func TestAutoModeResetsWhenBalanceIsZero(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
@@ -325,6 +386,7 @@ func newTestMonitor(t *testing.T, apiClient *fakeAPI, sender *fakeMailer, dataSt
 		ConfirmTokenTTL:           time.Hour,
 		PollInterval:              time.Second,
 		QueryLogDir:               filepath.Join(t.TempDir(), "logs"),
+		ResendResetEmailKey:       overrides.ResendResetEmailKey,
 		ManualConfirmSuccessCount: 0,
 		AutoResetEnabled:          false,
 		ResetCooldown:             time.Minute,
@@ -512,6 +574,19 @@ func (f *fakeStore) CreateConfirmToken(_ context.Context, tokenHash string, bala
 func (f *fakeStore) DeleteConfirmToken(_ context.Context, tokenHash string) error {
 	delete(f.tokens, tokenHash)
 	return nil
+}
+
+func (f *fakeStore) DeleteOtherActiveConfirmTokens(_ context.Context, keepTokenHash string) (int64, error) {
+	var deleted int64
+	now := time.Now()
+	for tokenHash, token := range f.tokens {
+		if tokenHash == keepTokenHash || token.used || !token.expiresAt.After(now) {
+			continue
+		}
+		delete(f.tokens, tokenHash)
+		deleted++
+	}
+	return deleted, nil
 }
 
 func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {

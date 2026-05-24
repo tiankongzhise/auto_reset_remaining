@@ -50,3 +50,40 @@ func TestRotateLogsHTTPHandler(t *testing.T) {
 		t.Fatalf("rotated files = %d, want 1", got)
 	}
 }
+
+func TestResendResetEmailHTTPHandler(t *testing.T) {
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ResendResetEmailKey: "resend-secret",
+	})
+	handler := NewHTTPHandler(monitor, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=wrong", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong key status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	if len(sender.messages) != 0 {
+		t.Fatalf("sent messages after wrong key = %d, want 0", len(sender.messages))
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=resend-secret", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("resend status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var result ResendConfirmEmailResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.Status != "resend_confirm_email_sent" {
+		t.Fatalf("status = %s, want resend_confirm_email_sent", result.Status)
+	}
+	if len(sender.messages) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(sender.messages))
+	}
+}

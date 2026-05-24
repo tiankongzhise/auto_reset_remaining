@@ -39,6 +39,7 @@ type Config struct {
 	LogRotationEnabled    bool
 	LogRotationArchiveDir string
 	LogRotationKey        string
+	ResendResetEmailKey   string
 	UserAgent             string
 
 	LowBalanceThreshold       float64
@@ -434,6 +435,7 @@ func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret f
 		LogRotationEnabled:        fileCfg.Logs.Rotation.Enabled,
 		LogRotationArchiveDir:     strings.TrimSpace(fileCfg.Logs.Rotation.ArchiveDir),
 		LogRotationKey:            strings.TrimSpace(lookupSecret("LOG_ROTATION_KEY")),
+		ResendResetEmailKey:       strings.TrimSpace(lookupSecret("RESEND_RESET_EMAIL_KEY")),
 		UserAgent:                 fileCfg.RayPlus.UserAgent,
 		LowBalanceThreshold:       fileCfg.Reset.LowBalanceThreshold,
 		BalanceJSONPath:           fileCfg.RayPlus.BalanceJSONPath,
@@ -491,18 +493,19 @@ func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret f
 func (c Config) Validate() error {
 	var missing []string
 	required := map[string]string{
-		"RAYPLUS_API_KEY":      c.RayPlusAPIKey,
-		"RAYPLUS_EMAIL":        c.RayPlusEmail,
-		"RAYPLUS_PASSWORD":     c.RayPlusPassword,
-		"rayplus.base_url":     c.RayPlusBaseURL,
-		"codex.base_url":       c.CodexBaseURL,
-		"http.public_base_url": c.PublicBaseURL,
-		"smtp.host":            c.SMTP.Host,
-		"smtp.from":            c.SMTP.From,
-		"pg_host":              c.PG.Host,
-		"pg_user":              c.PG.User,
-		"pg_database":          c.PG.Database,
-		"postgres.sslmode":     c.PG.SSLMode,
+		"RAYPLUS_API_KEY":        c.RayPlusAPIKey,
+		"RAYPLUS_EMAIL":          c.RayPlusEmail,
+		"RAYPLUS_PASSWORD":       c.RayPlusPassword,
+		"RESEND_RESET_EMAIL_KEY": c.ResendResetEmailKey,
+		"rayplus.base_url":       c.RayPlusBaseURL,
+		"codex.base_url":         c.CodexBaseURL,
+		"http.public_base_url":   c.PublicBaseURL,
+		"smtp.host":              c.SMTP.Host,
+		"smtp.from":              c.SMTP.From,
+		"pg_host":                c.PG.Host,
+		"pg_user":                c.PG.User,
+		"pg_database":            c.PG.Database,
+		"postgres.sslmode":       c.PG.SSLMode,
 	}
 	for key, value := range required {
 		if strings.TrimSpace(value) == "" {

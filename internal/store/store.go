@@ -38,6 +38,7 @@ type Store interface {
 	Init(ctx context.Context) error
 	CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time) error
 	DeleteConfirmToken(ctx context.Context, tokenHash string) error
+	DeleteOtherActiveConfirmTokens(ctx context.Context, keepTokenHash string) (int64, error)
 	HasActiveConfirmToken(ctx context.Context) (bool, error)
 	ConsumeConfirmToken(ctx context.Context, tokenHash string) (ConfirmToken, error)
 	MarkConfirmTokenReset(ctx context.Context, tokenID int64, resetLogID int64, manualSuccessCountAfter int) error
@@ -105,6 +106,18 @@ func (p *Postgres) CreateConfirmToken(ctx context.Context, tokenHash string, bal
 func (p *Postgres) DeleteConfirmToken(ctx context.Context, tokenHash string) error {
 	_, err := p.db.ExecContext(ctx, `DELETE FROM confirm_tokens WHERE token_hash = $1`, tokenHash)
 	return err
+}
+
+func (p *Postgres) DeleteOtherActiveConfirmTokens(ctx context.Context, keepTokenHash string) (int64, error) {
+	result, err := p.db.ExecContext(ctx,
+		`DELETE FROM confirm_tokens
+		 WHERE used_at IS NULL AND expires_at > now() AND token_hash <> $1`,
+		keepTokenHash,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (p *Postgres) HasActiveConfirmToken(ctx context.Context) (bool, error) {

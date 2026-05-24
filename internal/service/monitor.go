@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -22,7 +23,11 @@ import (
 	"auto_reset_remaining/internal/store"
 )
 
-var ErrDailyResetLimitReached = errors.New("daily reset limit reached")
+var (
+	ErrDailyResetLimitReached = errors.New("daily reset limit reached")
+	ErrResendUnauthorized     = errors.New("invalid resend reset email key")
+	ErrResendKeyMissing       = errors.New("resend reset email key is not configured")
+)
 
 type APIClient interface {
 	QueryBalance(ctx context.Context) (api.BalanceResult, error)
@@ -58,6 +63,14 @@ type ConfirmResult struct {
 	ManualConfirmSuccessCount int
 	AutoResetEnabled          bool
 	ResetLogID                int64
+}
+
+type ResendConfirmEmailResult struct {
+	Balance             float64   `json:"balance"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	InvalidatedOldLinks int64     `json:"invalidated_old_links"`
+	Status              string    `json:"status"`
+	NextPollInterval    string    `json:"next_poll_interval,omitempty"`
 }
 
 func NewMonitor(cfg config.Config, envPath string, apiClient APIClient, sender mailer.Sender, dataStore store.Store, queries *QueryLogger, logger *log.Logger) *Monitor {
@@ -241,15 +254,49 @@ func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cf
 		return statusPrefix + "_email_pending", nil
 	}
 
+	result, err := m.sendConfirmEmail(ctx, balance, cfg, statusPrefix)
+	if err != nil {
+		return result.Status, err
+	}
+	return result.Status, nil
+}
+
+func (m *Monitor) ResendConfirmEmail(ctx context.Context, key string) (ResendConfirmEmailResult, error) {
+	cfg := m.snapshot()
+	if !validSharedKey(cfg.ResendResetEmailKey, key) {
+		m.logger.Print("resend confirm email rejected reason=invalid_key")
+		if strings.TrimSpace(cfg.ResendResetEmailKey) == "" {
+			return ResendConfirmEmailResult{}, ErrResendKeyMissing
+		}
+		return ResendConfirmEmailResult{}, ErrResendUnauthorized
+	}
+
+	result, err := m.api.QueryBalance(ctx)
+	if err != nil {
+		m.logger.Printf("resend confirm email balance query failed error=%v", err)
+		return ResendConfirmEmailResult{}, err
+	}
+	m.observeBalance(time.Now(), result.Balance)
+
+	sendResult, err := m.sendConfirmEmail(ctx, result.Balance, cfg, "resend_confirm")
+	if err != nil {
+		return sendResult, err
+	}
+	m.logger.Printf("resend confirm email succeeded balance=%.6f expires_at=%s invalidated_old_links=%d",
+		sendResult.Balance, sendResult.ExpiresAt.Format(time.RFC3339), sendResult.InvalidatedOldLinks)
+	return sendResult, nil
+}
+
+func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg config.Config, statusPrefix string) (ResendConfirmEmailResult, error) {
 	rawToken, tokenHash, err := newConfirmToken()
 	if err != nil {
 		m.logger.Printf("confirm email token creation failed status_prefix=%s balance=%.6f error=%v", statusPrefix, balance, err)
-		return "confirm_token_error", err
+		return ResendConfirmEmailResult{Balance: balance, Status: "confirm_token_error"}, err
 	}
 	expiresAt := time.Now().Add(cfg.ConfirmTokenTTL)
 	if err := m.store.CreateConfirmToken(ctx, tokenHash, balance, expiresAt); err != nil {
 		m.logger.Printf("confirm email token store failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
-		return "confirm_token_store_error", err
+		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_store_error"}, err
 	}
 
 	link := confirmURL(cfg.PublicBaseURL, rawToken)
@@ -261,7 +308,14 @@ func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cf
 	if err := m.mailer.Send(ctx, subject, body); err != nil {
 		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
 		m.logger.Printf("confirm email send failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
-		return statusPrefix + "_email_error", err
+		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: statusPrefix + "_email_error"}, err
+	}
+	invalidated, err := m.store.DeleteOtherActiveConfirmTokens(ctx, tokenHash)
+	if err != nil {
+		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
+		m.logger.Printf("confirm email old token invalidation failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v",
+			statusPrefix, balance, tokenHashPrefix(tokenHash), err)
+		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_invalidation_error"}, err
 	}
 
 	m.mu.Lock()
@@ -271,9 +325,16 @@ func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cf
 		m.forceFastReferenceBalance = balance
 	}
 	m.mu.Unlock()
-	m.logger.Printf("confirm email sent status_prefix=%s balance=%.6f expires_at=%s token_hash_prefix=%s after_reset_email_polling=%t",
-		statusPrefix, balance, expiresAt.Format(time.RFC3339), tokenHashPrefix(tokenHash), cfg.Polling.AfterResetEmail.Enabled)
-	return statusPrefix + "_email_sent", nil
+	policy := m.nextPollPolicy(time.Now())
+	m.logger.Printf("confirm email sent status_prefix=%s balance=%.6f expires_at=%s token_hash_prefix=%s invalidated_old_links=%d after_reset_email_polling=%t",
+		statusPrefix, balance, expiresAt.Format(time.RFC3339), tokenHashPrefix(tokenHash), invalidated, cfg.Polling.AfterResetEmail.Enabled)
+	return ResendConfirmEmailResult{
+		Balance:             balance,
+		ExpiresAt:           expiresAt,
+		InvalidatedOldLinks: invalidated,
+		Status:              statusPrefix + "_email_sent",
+		NextPollInterval:    policy.Interval.String(),
+	}, nil
 }
 
 func (m *Monitor) maybeAutoReset(ctx context.Context, balance float64, cooldown time.Duration) (string, error) {
@@ -740,4 +801,13 @@ func redactConfirmURL(rawURL string) string {
 
 func IsInvalidToken(err error) bool {
 	return errors.Is(err, store.ErrTokenInvalid)
+}
+
+func validSharedKey(configured string, provided string) bool {
+	configured = strings.TrimSpace(configured)
+	provided = strings.TrimSpace(provided)
+	if configured == "" || len(provided) != len(configured) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(configured)) == 1
 }

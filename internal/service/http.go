@@ -42,6 +42,26 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 			result.SubscriptionID, result.Balance, result.ManualConfirmSuccessCount, result.AutoResetEnabled, result.ResetLogID)
 		_, _ = w.Write([]byte(message))
 	})
+	mux.HandleFunc("/resend-reset-email", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		result, err := monitor.ResendConfirmEmail(ctx, r.URL.Query().Get("key"))
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, ErrResendUnauthorized) || errors.Is(err, ErrResendKeyMissing) {
+				status = http.StatusUnauthorized
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(result)
+	})
 	mux.HandleFunc("/rotate-logs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
