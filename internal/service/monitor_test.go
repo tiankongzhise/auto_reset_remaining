@@ -51,6 +51,9 @@ func TestConfirmThirdManualSuccessEnablesAutoReset(t *testing.T) {
 	if err := dataStore.CreateConfirmToken(ctx, hashToken(rawToken), 0.4, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	if err := dataStore.MarkConfirmTokenEmailSent(ctx, hashToken(rawToken)); err != nil {
+		t.Fatal(err)
+	}
 	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
 		ManualConfirmSuccessCount: 2,
 	})
@@ -155,6 +158,107 @@ func TestResendConfirmEmailRejectsWrongKey(t *testing.T) {
 	}
 	if len(sender.messages) != 0 {
 		t.Fatalf("sent messages = %d, want 0", len(sender.messages))
+	}
+}
+
+func TestResendConfirmEmailRefreshesSMTPConfigFromTOML(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	configPath := filepath.Join(dir, "config.toml")
+	writeServiceEnv(t, envPath)
+	writeTestServiceConfig(t, configPath, 2525)
+
+	cfg, err := config.Load(envPath, configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := NewMonitor(cfg, envPath, apiClient, sender, dataStore, NewQueryLogger(filepath.Join(dir, "logs")), nil)
+
+	writeTestServiceConfig(t, configPath, 465)
+	result, err := monitor.ResendConfirmEmail(ctx, "resend-secret")
+	if err != nil {
+		t.Fatalf("ResendConfirmEmail() error = %v", err)
+	}
+	if result.Status != "resend_confirm_email_sent" {
+		t.Fatalf("status = %s, want resend_confirm_email_sent", result.Status)
+	}
+	if len(sender.configs) == 0 {
+		t.Fatal("mailer config was not refreshed")
+	}
+	if got := sender.configs[len(sender.configs)-1].Port; got != 465 {
+		t.Fatalf("refreshed SMTP port = %d, want 465", got)
+	}
+}
+
+func TestUnsentConfirmTokenDoesNotBlockNewEmail(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	legacyTokenHash := hashToken("legacy-unsent-token")
+	if err := dataStore.CreateConfirmToken(ctx, legacyTokenHash, 0.4, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+	if err := monitor.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "low_balance_email_sent" {
+		t.Fatalf("Tick() status = %s, want low_balance_email_sent", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages = %d, want 1", got)
+	}
+	if _, err := monitor.Confirm(ctx, "legacy-unsent-token"); !errors.Is(err, store.ErrTokenInvalid) {
+		t.Fatalf("Confirm(legacy unsent token) error = %v, want ErrTokenInvalid", err)
+	}
+}
+
+func TestFailedConfirmEmailClearsPendingAndCanRetry(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sendErr := errors.New("smtp auth failed")
+	sender := &fakeMailer{err: sendErr}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("first Tick() error = %v, want %v", err, sendErr)
+	}
+	if status != "low_balance_email_error" {
+		t.Fatalf("first Tick() status = %s, want low_balance_email_error", status)
+	}
+	if got := len(dataStore.tokens); got != 0 {
+		t.Fatalf("tokens after failed send = %d, want 0", got)
+	}
+
+	monitor.mu.Lock()
+	monitor.pendingManualEmail = true
+	monitor.mu.Unlock()
+	sender.err = nil
+
+	status, err = monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("retry Tick() error = %v", err)
+	}
+	if status != "low_balance_email_sent" {
+		t.Fatalf("retry Tick() status = %s, want low_balance_email_sent", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages = %d, want 1", got)
 	}
 }
 
@@ -292,6 +396,9 @@ func TestConfirmRejectsWhenDailyLimitReachedWithoutConsumingToken(t *testing.T) 
 	if err := dataStore.CreateConfirmToken(ctx, tokenHash, 0.4, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	if err := dataStore.MarkConfirmTokenEmailSent(ctx, tokenHash); err != nil {
+		t.Fatal(err)
+	}
 	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
 		DailyMaxResetCount: 1,
 	})
@@ -418,10 +525,42 @@ func writeConfig(t *testing.T, manualConfirmSuccessCount int, autoResetEnabled b
 	path := filepath.Join(t.TempDir(), "config.toml")
 	body := strings.ReplaceAll(testServiceConfigTOML, "{{AUTO_RESET_ENABLED}}", boolString(autoResetEnabled))
 	body = strings.ReplaceAll(body, "{{MANUAL_CONFIRM_SUCCESS_COUNT}}", intString(manualConfirmSuccessCount))
+	body = strings.ReplaceAll(body, "{{SMTP_PORT}}", "587")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeServiceEnv(t *testing.T, path string) {
+	t.Helper()
+	body := strings.Join([]string{
+		"RAYPLUS_API_KEY=sk-test",
+		"RAYPLUS_EMAIL=user@example.com",
+		"RAYPLUS_PASSWORD=password",
+		"SMTP_USER=smtp-user@example.com",
+		"SMTP_PASSWORD=smtp-password",
+		"pg_host=localhost",
+		"pg_port=15432",
+		"pg_user=pg user",
+		"pg_password=pg password",
+		"pg_database=auto_reset",
+		"LOG_ROTATION_KEY=secret-key",
+		"RESEND_RESET_EMAIL_KEY=resend-secret",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestServiceConfig(t *testing.T, path string, smtpPort int) {
+	t.Helper()
+	body := strings.ReplaceAll(testServiceConfigTOML, "{{AUTO_RESET_ENABLED}}", "false")
+	body = strings.ReplaceAll(body, "{{MANUAL_CONFIRM_SUCCESS_COUNT}}", "0")
+	body = strings.ReplaceAll(body, "{{SMTP_PORT}}", strconv.Itoa(smtpPort))
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func boolString(value bool) string {
@@ -456,7 +595,7 @@ subscription_id = 1716
 
 [smtp]
 host = "smtp.example.com"
-port = 587
+port = {{SMTP_PORT}}
 from = "sender@example.com"
 to = ["receiver@example.com"]
 
@@ -536,11 +675,21 @@ func (f *fakeAPI) ResetQuota(context.Context) (api.ResetResult, error) {
 
 type fakeMailer struct {
 	messages []string
+	err      error
+	configs  []config.SMTPConfig
 }
 
 func (f *fakeMailer) Send(_ context.Context, subject string, body string) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.messages = append(f.messages, subject+"\n"+body)
 	return nil
+}
+
+func (f *fakeMailer) SetConfig(cfg config.SMTPConfig) {
+	cfg.To = append([]string(nil), cfg.To...)
+	f.configs = append(f.configs, cfg)
 }
 
 type fakeStore struct {
@@ -555,6 +704,7 @@ type fakeToken struct {
 	balance   float64
 	expiresAt time.Time
 	used      bool
+	emailSent bool
 }
 
 func newFakeStore() *fakeStore {
@@ -584,7 +734,9 @@ func (f *fakeStore) DeleteOtherActiveConfirmTokens(_ context.Context, keepTokenH
 			continue
 		}
 		delete(f.tokens, tokenHash)
-		deleted++
+		if token.emailSent {
+			deleted++
+		}
 	}
 	return deleted, nil
 }
@@ -592,16 +744,26 @@ func (f *fakeStore) DeleteOtherActiveConfirmTokens(_ context.Context, keepTokenH
 func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
 	now := time.Now()
 	for _, token := range f.tokens {
-		if !token.used && token.expiresAt.After(now) {
+		if token.emailSent && !token.used && token.expiresAt.After(now) {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func (f *fakeStore) ConsumeConfirmToken(_ context.Context, tokenHash string) (store.ConfirmToken, error) {
+func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash string) error {
 	token, ok := f.tokens[tokenHash]
 	if !ok || token.used || token.expiresAt.Before(time.Now()) {
+		return store.ErrTokenInvalid
+	}
+	token.emailSent = true
+	f.tokens[tokenHash] = token
+	return nil
+}
+
+func (f *fakeStore) ConsumeConfirmToken(_ context.Context, tokenHash string) (store.ConfirmToken, error) {
+	token, ok := f.tokens[tokenHash]
+	if !ok || !token.emailSent || token.used || token.expiresAt.Before(time.Now()) {
 		return store.ConfirmToken{}, store.ErrTokenInvalid
 	}
 	token.used = true

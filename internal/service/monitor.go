@@ -77,6 +77,9 @@ func NewMonitor(cfg config.Config, envPath string, apiClient APIClient, sender m
 	if logger == nil {
 		logger = log.Default()
 	}
+	if cfg.EnvPath == "" {
+		cfg.EnvPath = envPath
+	}
 	configPath := cfg.TOMLPath
 	if configPath == "" {
 		configPath = envPath
@@ -238,7 +241,18 @@ func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cf
 	pending := m.pendingManualEmail
 	m.mu.Unlock()
 	if pending {
-		return statusPrefix + "_email_pending", nil
+		hasActive, err := m.store.HasActiveConfirmToken(ctx)
+		if err != nil {
+			m.logger.Printf("confirm email token check failed status_prefix=%s balance=%.6f error=%v", statusPrefix, balance, err)
+			return "confirm_token_check_error", err
+		}
+		if hasActive {
+			return statusPrefix + "_email_pending", nil
+		}
+		m.mu.Lock()
+		m.pendingManualEmail = false
+		m.mu.Unlock()
+		m.logger.Printf("confirm email pending state cleared status_prefix=%s balance=%.6f reason=no_active_token", statusPrefix, balance)
 	}
 
 	hasActive, err := m.store.HasActiveConfirmToken(ctx)
@@ -262,7 +276,11 @@ func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cf
 }
 
 func (m *Monitor) ResendConfirmEmail(ctx context.Context, key string) (ResendConfirmEmailResult, error) {
-	cfg := m.snapshot()
+	cfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("resend confirm email config refresh failed error=%v", refreshErr)
+		cfg = m.snapshot()
+	}
 	if !validSharedKey(cfg.ResendResetEmailKey, key) {
 		m.logger.Print("resend confirm email rejected reason=invalid_key")
 		if strings.TrimSpace(cfg.ResendResetEmailKey) == "" {
@@ -288,6 +306,13 @@ func (m *Monitor) ResendConfirmEmail(ctx context.Context, key string) (ResendCon
 }
 
 func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg config.Config, statusPrefix string) (ResendConfirmEmailResult, error) {
+	freshCfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("confirm email config refresh failed status_prefix=%s error=%v", statusPrefix, refreshErr)
+	} else {
+		cfg = freshCfg
+	}
+
 	rawToken, tokenHash, err := newConfirmToken()
 	if err != nil {
 		m.logger.Printf("confirm email token creation failed status_prefix=%s balance=%.6f error=%v", statusPrefix, balance, err)
@@ -307,12 +332,21 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		statusPrefix, balance, cfg.LowBalanceThreshold, expiresAt.Format(time.RFC3339), len(cfg.SMTP.To), redactConfirmURL(link), tokenHashPrefix(tokenHash))
 	if err := m.mailer.Send(ctx, subject, body); err != nil {
 		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
+		m.syncPendingManualEmail(ctx, statusPrefix, balance)
 		m.logger.Printf("confirm email send failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
 		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: statusPrefix + "_email_error"}, err
+	}
+	if err := m.store.MarkConfirmTokenEmailSent(ctx, tokenHash); err != nil {
+		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
+		m.syncPendingManualEmail(ctx, statusPrefix, balance)
+		m.logger.Printf("confirm email sent token state failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v",
+			statusPrefix, balance, tokenHashPrefix(tokenHash), err)
+		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_email_state_error"}, err
 	}
 	invalidated, err := m.store.DeleteOtherActiveConfirmTokens(ctx, tokenHash)
 	if err != nil {
 		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
+		m.syncPendingManualEmail(ctx, statusPrefix, balance)
 		m.logger.Printf("confirm email old token invalidation failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v",
 			statusPrefix, balance, tokenHashPrefix(tokenHash), err)
 		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_invalidation_error"}, err
@@ -480,6 +514,42 @@ func (m *Monitor) notifyDailyLimitAfterReset(ctx context.Context) {
 		m.logger.Printf("daily reset limit email failed after reset reset_count=%d max=%d error=%v",
 			state.ResetCount, state.MaxResetCount, err)
 	}
+}
+
+func (m *Monitor) refreshEmailConfig() (config.Config, error) {
+	current := m.snapshot()
+	envPath := current.EnvPath
+	tomlPath := current.TOMLPath
+	if strings.TrimSpace(envPath) == "" || strings.TrimSpace(tomlPath) == "" {
+		return current, nil
+	}
+
+	fresh, err := config.Load(envPath, tomlPath)
+	if err != nil {
+		return current, err
+	}
+	if err := fresh.Validate(); err != nil {
+		return current, err
+	}
+
+	m.mu.Lock()
+	m.cfg = fresh
+	m.mu.Unlock()
+	if updater, ok := m.mailer.(interface{ SetConfig(config.SMTPConfig) }); ok {
+		updater.SetConfig(fresh.SMTP)
+	}
+	return fresh, nil
+}
+
+func (m *Monitor) syncPendingManualEmail(ctx context.Context, statusPrefix string, balance float64) {
+	hasActive, err := m.store.HasActiveConfirmToken(ctx)
+	if err != nil {
+		m.logger.Printf("confirm email pending sync failed status_prefix=%s balance=%.6f error=%v", statusPrefix, balance, err)
+		return
+	}
+	m.mu.Lock()
+	m.pendingManualEmail = hasActive
+	m.mu.Unlock()
 }
 
 func (m *Monitor) dailyResetLimitState(ctx context.Context, cfg config.Config, now time.Time) (store.DailyResetLimitState, error) {
