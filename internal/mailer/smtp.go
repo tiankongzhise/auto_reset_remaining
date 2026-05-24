@@ -17,6 +17,10 @@ type Sender interface {
 	Send(ctx context.Context, subject string, body string) error
 }
 
+type HTMLSender interface {
+	SendHTML(ctx context.Context, subject string, plainBody string, htmlBody string) error
+}
+
 type SMTPMailer struct {
 	mu  sync.RWMutex
 	cfg config.SMTPConfig
@@ -34,10 +38,18 @@ func (m *SMTPMailer) SetConfig(cfg config.SMTPConfig) {
 
 func (m *SMTPMailer) Send(ctx context.Context, subject string, body string) error {
 	cfg := m.snapshot()
+	return m.send(ctx, cfg, message(cfg, subject, body))
+}
+
+func (m *SMTPMailer) SendHTML(ctx context.Context, subject string, plainBody string, htmlBody string) error {
+	cfg := m.snapshot()
+	return m.send(ctx, cfg, htmlMessage(cfg, subject, plainBody, htmlBody))
+}
+
+func (m *SMTPMailer) send(ctx context.Context, cfg config.SMTPConfig, message []byte) error {
 	if len(cfg.To) == 0 {
 		return fmt.Errorf("SMTP_TO is empty")
 	}
-	message := message(cfg, subject, body)
 	address := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	dialer := net.Dialer{}
 
@@ -117,4 +129,32 @@ func message(cfg config.SMTPConfig, subject string, body string) []byte {
 		"Content-Transfer-Encoding: 8bit",
 	}
 	return []byte(strings.Join(headers, "\r\n") + "\r\n\r\n" + body + "\r\n")
+}
+
+func htmlMessage(cfg config.SMTPConfig, subject string, plainBody string, htmlBody string) []byte {
+	boundary := "auto_reset_remaining_alt_boundary"
+	headers := []string{
+		"From: " + cfg.From,
+		"To: " + strings.Join(cfg.To, ", "),
+		"Subject: " + mime.BEncoding.Encode("UTF-8", subject),
+		"MIME-Version: 1.0",
+		`Content-Type: multipart/alternative; boundary="` + boundary + `"`,
+	}
+	parts := []string{
+		strings.Join(headers, "\r\n"),
+		"",
+		"--" + boundary,
+		"Content-Type: text/plain; charset=UTF-8",
+		"Content-Transfer-Encoding: 8bit",
+		"",
+		plainBody,
+		"--" + boundary,
+		"Content-Type: text/html; charset=UTF-8",
+		"Content-Transfer-Encoding: 8bit",
+		"",
+		htmlBody,
+		"--" + boundary + "--",
+		"",
+	}
+	return []byte(strings.Join(parts, "\r\n"))
 }

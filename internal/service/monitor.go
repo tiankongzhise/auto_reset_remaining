@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"math"
 	"net/url"
@@ -457,19 +458,18 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		m.logger.Printf("confirm email token creation failed status_prefix=%s balance=%.6f error=%v", statusPrefix, balance, err)
 		return ResendConfirmEmailResult{Balance: balance, Status: "confirm_token_error"}, err
 	}
-	expiresAt := time.Now().Add(cfg.ConfirmTokenTTL)
-	if err := m.store.CreateConfirmToken(ctx, tokenHash, balance, expiresAt); err != nil {
+	expiresAt, expireReason := confirmTokenExpiresAt(time.Now(), cfg.ConfirmTokenTTL)
+	if err := m.store.CreateConfirmToken(ctx, tokenHash, balance, expiresAt, expireReason); err != nil {
 		m.logger.Printf("confirm email token store failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
 		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_store_error"}, err
 	}
 
 	link := confirmURL(cfg.PublicBaseURL, rawToken)
 	subject := "余额不足，请确认重置订阅"
-	body := fmt.Sprintf("当前余额 %.6f，已低于阈值 %.6f。\n\n点击下面链接确认重置订阅：\n%s\n\n链接将在 %s 过期。如果不是你本人操作，请忽略本邮件。",
-		balance, cfg.LowBalanceThreshold, link, expiresAt.Format(time.RFC3339))
+	plainBody, htmlBody := confirmEmailBody(balance, cfg.LowBalanceThreshold, link, expiresAt)
 	m.logger.Printf("confirm email sending status_prefix=%s balance=%.6f threshold=%.6f expires_at=%s recipients=%d confirm_url=%s token_hash_prefix=%s",
 		statusPrefix, balance, cfg.LowBalanceThreshold, expiresAt.Format(time.RFC3339), len(cfg.SMTP.To), redactConfirmURL(link), tokenHashPrefix(tokenHash))
-	if err := m.mailer.Send(ctx, subject, body); err != nil {
+	if err := m.sendEmail(ctx, subject, plainBody, htmlBody); err != nil {
 		_ = m.store.DeleteConfirmToken(ctx, tokenHash)
 		m.syncPendingManualEmail(ctx, statusPrefix, balance)
 		m.logger.Printf("confirm email send failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
@@ -701,6 +701,15 @@ func (m *Monitor) sendManualResetNotification(ctx context.Context, cfg config.Co
 	subject := "订阅额度已通过手动方式重置"
 	body := fmt.Sprintf("当前余额：%.6f\n\n用户通过手动方式重置了订阅额度。\n订阅 ID：%d\n重置日志 ID：%d\n", balance, subscriptionID, resetLogID)
 	return m.mailer.Send(ctx, subject, body)
+}
+
+func (m *Monitor) sendEmail(ctx context.Context, subject string, plainBody string, htmlBody string) error {
+	if htmlBody != "" {
+		if sender, ok := m.mailer.(mailer.HTMLSender); ok {
+			return sender.SendHTML(ctx, subject, plainBody, htmlBody)
+		}
+	}
+	return m.mailer.Send(ctx, subject, plainBody)
 }
 
 func (m *Monitor) notifyDailyLimitAfterReset(ctx context.Context) {
@@ -1041,6 +1050,43 @@ func newConfirmToken() (raw string, hash string, err error) {
 	}
 	raw = base64.RawURLEncoding.EncodeToString(bytes)
 	return raw, hashToken(raw), nil
+}
+
+func confirmTokenExpiresAt(now time.Time, ttl time.Duration) (time.Time, store.ConfirmTokenExpireReason) {
+	expiresAt := now.Add(ttl)
+	midnight := nextLocalMidnight(now)
+	if midnight.Before(expiresAt) {
+		return midnight, store.ConfirmTokenExpireReasonAutoReset
+	}
+	return expiresAt, store.ConfirmTokenExpireReasonTTL
+}
+
+func nextLocalMidnight(now time.Time) time.Time {
+	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+}
+
+func confirmEmailBody(balance float64, threshold float64, link string, expiresAt time.Time) (string, string) {
+	expiresText := expiresAt.Format("2006-01-02 15:04:05 MST")
+	plainBody := fmt.Sprintf("当前余额：%.6f\n低余额阈值：%.6f\n\n请点击“重置订阅”按钮确认重置订阅额度。\n\n如果按钮不能点击或无法自动跳转，也可以复制以下网址到浏览器访问：\n%s\n\n由于 0 点系统会自动重置订阅，本链接将在 %s 失效。如果不是你本人操作，请忽略本邮件。",
+		balance, threshold, link, expiresText)
+	htmlBody := fmt.Sprintf(`<!doctype html>
+<html>
+<body style="margin:0;padding:24px;background:#f6f8fb;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.6;">
+  <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;padding:24px;">
+    <h2 style="margin:0 0 16px;font-size:20px;line-height:1.35;color:#111827;">余额不足，请确认重置订阅</h2>
+    <p style="margin:0 0 8px;">当前余额：<strong>%.6f</strong></p>
+    <p style="margin:0 0 20px;">低余额阈值：%.6f</p>
+    <p style="margin:0 0 20px;">请点击下面的按钮确认重置订阅额度。</p>
+    <p style="margin:0 0 24px;">
+      <a href="%s" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;border-radius:6px;padding:12px 20px;">重置订阅</a>
+    </p>
+    <p style="margin:0 0 8px;color:#4b5563;">如果按钮不能点击或无法自动跳转，也可以复制以下网址到浏览器访问：</p>
+    <p style="margin:0 0 20px;word-break:break-all;"><a href="%s" style="color:#2563eb;">%s</a></p>
+    <p style="margin:0;color:#4b5563;">由于 0 点系统会自动重置订阅，本链接将在 %s 失效。如果不是你本人操作，请忽略本邮件。</p>
+  </div>
+</body>
+</html>`, balance, threshold, html.EscapeString(link), html.EscapeString(link), html.EscapeString(link), html.EscapeString(expiresText))
+	return plainBody, htmlBody
 }
 
 func hashToken(raw string) string {

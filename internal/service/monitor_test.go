@@ -42,13 +42,71 @@ func TestLowBalanceSendsOneEmail(t *testing.T) {
 	}
 }
 
+func TestConfirmEmailUsesButtonCopyFallbackAndMidnightExpiry(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "low_balance_email_sent" {
+		t.Fatalf("Tick() status = %s", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("plain messages = %d, want 1", got)
+	}
+	if got := len(sender.html); got != 1 {
+		t.Fatalf("html messages = %d, want 1", got)
+	}
+	if !strings.Contains(sender.html[0], ">重置订阅</a>") {
+		t.Fatalf("html message missing reset button:\n%s", sender.html[0])
+	}
+	if !strings.Contains(sender.messages[0], "如果按钮不能点击或无法自动跳转，也可以复制以下网址到浏览器访问") {
+		t.Fatalf("plain message missing copy fallback:\n%s", sender.messages[0])
+	}
+	token := extractToken(t, sender.messages[0])
+	stored := dataStore.tokens[hashToken(token)]
+	midnight := nextLocalMidnight(time.Now())
+	if stored.expiresAt.After(midnight) {
+		t.Fatalf("token expiresAt = %s, want no later than midnight %s", stored.expiresAt, midnight)
+	}
+}
+
+func TestConfirmEmailExpiryUsesShorterTTLBeforeMidnight(t *testing.T) {
+	now := time.Date(2026, 5, 25, 10, 0, 0, 0, time.Local)
+	got, reason := confirmTokenExpiresAt(now, time.Hour)
+	want := now.Add(time.Hour)
+	if !got.Equal(want) {
+		t.Fatalf("confirmTokenExpiresAt() = %s, want %s", got, want)
+	}
+	if reason != store.ConfirmTokenExpireReasonTTL {
+		t.Fatalf("expire reason = %s, want ttl", reason)
+	}
+}
+
+func TestConfirmEmailExpiryCapsAtMidnight(t *testing.T) {
+	now := time.Date(2026, 5, 25, 23, 0, 0, 0, time.Local)
+	got, reason := confirmTokenExpiresAt(now, 24*time.Hour)
+	want := time.Date(2026, 5, 26, 0, 0, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Fatalf("confirmTokenExpiresAt() = %s, want %s", got, want)
+	}
+	if reason != store.ConfirmTokenExpireReasonAutoReset {
+		t.Fatalf("expire reason = %s, want auto_reset", reason)
+	}
+}
+
 func TestConfirmThirdManualSuccessEnablesAutoReset(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0.4, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
 	sender := &fakeMailer{}
 	dataStore := newFakeStore()
 	rawToken := "manual-confirm-token"
-	if err := dataStore.CreateConfirmToken(ctx, hashToken(rawToken), 0.4, time.Now().Add(time.Hour)); err != nil {
+	if err := dataStore.CreateConfirmToken(ctx, hashToken(rawToken), 0.4, time.Now().Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
 		t.Fatal(err)
 	}
 	if err := dataStore.MarkConfirmTokenEmailSent(ctx, hashToken(rawToken)); err != nil {
@@ -290,6 +348,39 @@ func TestCancelResetEmailsMarksManualCancelledAndDoesNotBlockFlow(t *testing.T) 
 	}
 }
 
+func TestAutoResetExpiredConfirmTokenDoesNotBlockFlow(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	expiredHash := hashToken("expired-by-auto-reset")
+	dataStore.tokens[expiredHash] = fakeToken{
+		id:           1,
+		balance:      0.4,
+		expiresAt:    time.Now().Add(-time.Minute),
+		emailSent:    true,
+		expireReason: store.ConfirmTokenExpireReasonAutoReset,
+	}
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	if _, err := monitor.Confirm(ctx, "expired-by-auto-reset"); !errors.Is(err, store.ErrTokenInvalid) {
+		t.Fatalf("Confirm(expired token) error = %v, want ErrTokenInvalid", err)
+	}
+	if !dataStore.tokens[expiredHash].expired {
+		t.Fatal("expired token was not marked auto-reset expired")
+	}
+	if !dataStore.tokens[expiredHash].autoResetExpired {
+		t.Fatal("expired token was not marked as auto-reset invalidated")
+	}
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "low_balance_email_sent" {
+		t.Fatalf("Tick() status = %s, want low_balance_email_sent", status)
+	}
+}
+
 func TestResendConfirmEmailRefreshesSMTPConfigFromTOML(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -332,7 +423,7 @@ func TestUnsentConfirmTokenDoesNotBlockNewEmail(t *testing.T) {
 	sender := &fakeMailer{}
 	dataStore := newFakeStore()
 	legacyTokenHash := hashToken("legacy-unsent-token")
-	if err := dataStore.CreateConfirmToken(ctx, legacyTokenHash, 0.4, time.Now().Add(time.Hour)); err != nil {
+	if err := dataStore.CreateConfirmToken(ctx, legacyTokenHash, 0.4, time.Now().Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
 		t.Fatal(err)
 	}
 	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
@@ -522,7 +613,7 @@ func TestConfirmRejectsWhenDailyLimitReachedWithoutConsumingToken(t *testing.T) 
 	dataStore.resetLogs = append(dataStore.resetLogs, store.ResetLog{Mode: "auto", Success: true})
 	rawToken := "manual-confirm-token"
 	tokenHash := hashToken(rawToken)
-	if err := dataStore.CreateConfirmToken(ctx, tokenHash, 0.4, time.Now().Add(time.Hour)); err != nil {
+	if err := dataStore.CreateConfirmToken(ctx, tokenHash, 0.4, time.Now().Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
 		t.Fatal(err)
 	}
 	if err := dataStore.MarkConfirmTokenEmailSent(ctx, tokenHash); err != nil {
@@ -812,6 +903,7 @@ func (f *fakeAPI) ResetQuota(context.Context) (api.ResetResult, error) {
 
 type fakeMailer struct {
 	messages []string
+	html     []string
 	err      error
 	configs  []config.SMTPConfig
 }
@@ -821,6 +913,15 @@ func (f *fakeMailer) Send(_ context.Context, subject string, body string) error 
 		return f.err
 	}
 	f.messages = append(f.messages, subject+"\n"+body)
+	return nil
+}
+
+func (f *fakeMailer) SendHTML(_ context.Context, subject string, plainBody string, htmlBody string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.messages = append(f.messages, subject+"\n"+plainBody)
+	f.html = append(f.html, htmlBody)
 	return nil
 }
 
@@ -837,12 +938,15 @@ type fakeStore struct {
 }
 
 type fakeToken struct {
-	id        int64
-	balance   float64
-	expiresAt time.Time
-	used      bool
-	emailSent bool
-	cancelled bool
+	id               int64
+	balance          float64
+	expiresAt        time.Time
+	used             bool
+	emailSent        bool
+	cancelled        bool
+	expired          bool
+	autoResetExpired bool
+	expireReason     store.ConfirmTokenExpireReason
 }
 
 func newFakeStore() *fakeStore {
@@ -853,8 +957,11 @@ func (f *fakeStore) Init(context.Context) error {
 	return nil
 }
 
-func (f *fakeStore) CreateConfirmToken(_ context.Context, tokenHash string, balance float64, expiresAt time.Time) error {
-	f.tokens[tokenHash] = fakeToken{id: f.nextID, balance: balance, expiresAt: expiresAt}
+func (f *fakeStore) CreateConfirmToken(_ context.Context, tokenHash string, balance float64, expiresAt time.Time, expireReason store.ConfirmTokenExpireReason) error {
+	if expireReason == "" {
+		expireReason = store.ConfirmTokenExpireReasonTTL
+	}
+	f.tokens[tokenHash] = fakeToken{id: f.nextID, balance: balance, expiresAt: expiresAt, expireReason: expireReason}
 	f.nextID++
 	return nil
 }
@@ -890,10 +997,26 @@ func (f *fakeStore) CancelUnverifiedConfirmEmails(context.Context) (int64, error
 	return cancelled, nil
 }
 
+func (f *fakeStore) ExpireAutoResetInvalidatedConfirmTokens(context.Context) (int64, error) {
+	var expired int64
+	now := time.Now()
+	for tokenHash, token := range f.tokens {
+		if !token.emailSent || token.used || token.cancelled || token.expired || token.expiresAt.After(now) {
+			continue
+		}
+		token.expired = true
+		token.autoResetExpired = token.expireReason == store.ConfirmTokenExpireReasonAutoReset
+		f.tokens[tokenHash] = token
+		expired++
+	}
+	return expired, nil
+}
+
 func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
+	_, _ = f.ExpireAutoResetInvalidatedConfirmTokens(context.Background())
 	now := time.Now()
 	for _, token := range f.tokens {
-		if token.emailSent && !token.used && !token.cancelled && token.expiresAt.After(now) {
+		if token.emailSent && !token.used && !token.cancelled && !token.expired && token.expiresAt.After(now) {
 			return true, nil
 		}
 	}
@@ -902,7 +1025,7 @@ func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
 
 func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash string) error {
 	token, ok := f.tokens[tokenHash]
-	if !ok || token.used || token.cancelled || token.expiresAt.Before(time.Now()) {
+	if !ok || token.used || token.cancelled || token.expired || token.expiresAt.Before(time.Now()) {
 		return store.ErrTokenInvalid
 	}
 	token.emailSent = true
@@ -911,8 +1034,9 @@ func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash strin
 }
 
 func (f *fakeStore) ConsumeConfirmToken(_ context.Context, tokenHash string) (store.ConfirmToken, error) {
+	_, _ = f.ExpireAutoResetInvalidatedConfirmTokens(context.Background())
 	token, ok := f.tokens[tokenHash]
-	if !ok || !token.emailSent || token.used || token.cancelled || token.expiresAt.Before(time.Now()) {
+	if !ok || !token.emailSent || token.used || token.cancelled || token.expired || token.expiresAt.Before(time.Now()) {
 		return store.ConfirmToken{}, store.ErrTokenInvalid
 	}
 	token.used = true

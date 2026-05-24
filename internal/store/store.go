@@ -25,6 +25,13 @@ type ConfirmToken struct {
 	ExpiresAt time.Time
 }
 
+type ConfirmTokenExpireReason string
+
+const (
+	ConfirmTokenExpireReasonTTL       ConfirmTokenExpireReason = "ttl"
+	ConfirmTokenExpireReasonAutoReset ConfirmTokenExpireReason = "auto_reset"
+)
+
 type DailyResetLimitState struct {
 	Day                       time.Time
 	ResetCount                int
@@ -36,10 +43,11 @@ type DailyResetLimitState struct {
 
 type Store interface {
 	Init(ctx context.Context) error
-	CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time) error
+	CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time, expireReason ConfirmTokenExpireReason) error
 	DeleteConfirmToken(ctx context.Context, tokenHash string) error
 	DeleteOtherActiveConfirmTokens(ctx context.Context, keepTokenHash string) (int64, error)
 	CancelUnverifiedConfirmEmails(ctx context.Context) (int64, error)
+	ExpireAutoResetInvalidatedConfirmTokens(ctx context.Context) (int64, error)
 	HasActiveConfirmToken(ctx context.Context) (bool, error)
 	MarkConfirmTokenEmailSent(ctx context.Context, tokenHash string) error
 	ConsumeConfirmToken(ctx context.Context, tokenHash string) (ConfirmToken, error)
@@ -81,18 +89,28 @@ func (p *Postgres) Init(ctx context.Context) error {
 			expires_at TIMESTAMPTZ NOT NULL,
 			used_at TIMESTAMPTZ,
 			cancelled_at TIMESTAMPTZ,
+			invalidated_at TIMESTAMPTZ,
+			expire_reason TEXT NOT NULL DEFAULT 'ttl',
 			status TEXT NOT NULL DEFAULT 'created',
 			reset_log_id BIGINT REFERENCES reset_logs(id),
 			manual_success_count_after INTEGER
 		)`,
 		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS email_sent_at TIMESTAMPTZ`,
 		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`,
+		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS invalidated_at TIMESTAMPTZ`,
+		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS expire_reason TEXT`,
+		`UPDATE confirm_tokens SET expire_reason = 'ttl' WHERE expire_reason IS NULL OR expire_reason = ''`,
+		`ALTER TABLE confirm_tokens ALTER COLUMN expire_reason SET DEFAULT 'ttl'`,
+		`ALTER TABLE confirm_tokens ALTER COLUMN expire_reason SET NOT NULL`,
 		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS status TEXT`,
 		`UPDATE confirm_tokens
 		 SET status = CASE
 			WHEN reset_log_id IS NOT NULL THEN 'reset'
 			WHEN used_at IS NOT NULL THEN 'used'
+			WHEN status = 'manual_cancelled' THEN 'manual_cancelled'
+			WHEN status = 'auto_reset_expired' THEN 'auto_reset_expired'
 			WHEN email_sent_at IS NOT NULL AND expires_at > now() THEN 'email_sent'
+			WHEN email_sent_at IS NOT NULL AND expire_reason = 'auto_reset' THEN 'auto_reset_expired'
 			WHEN email_sent_at IS NOT NULL THEN 'expired'
 			ELSE 'created'
 		 END
@@ -113,13 +131,17 @@ func (p *Postgres) Init(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	_, err := p.ExpireAutoResetInvalidatedConfirmTokens(ctx)
+	return err
 }
 
-func (p *Postgres) CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time) error {
+func (p *Postgres) CreateConfirmToken(ctx context.Context, tokenHash string, balance float64, expiresAt time.Time, expireReason ConfirmTokenExpireReason) error {
+	if expireReason == "" {
+		expireReason = ConfirmTokenExpireReasonTTL
+	}
 	_, err := p.db.ExecContext(ctx,
-		`INSERT INTO confirm_tokens (token_hash, balance, expires_at) VALUES ($1, $2, $3)`,
-		tokenHash, balance, expiresAt,
+		`INSERT INTO confirm_tokens (token_hash, balance, expires_at, expire_reason) VALUES ($1, $2, $3, $4)`,
+		tokenHash, balance, expiresAt, string(expireReason),
 	)
 	return err
 }
@@ -157,7 +179,26 @@ func (p *Postgres) CancelUnverifiedConfirmEmails(ctx context.Context) (int64, er
 	return result.RowsAffected()
 }
 
+func (p *Postgres) ExpireAutoResetInvalidatedConfirmTokens(ctx context.Context) (int64, error) {
+	result, err := p.db.ExecContext(ctx,
+		`UPDATE confirm_tokens
+		 SET status = CASE WHEN expire_reason = 'auto_reset' THEN 'auto_reset_expired' ELSE 'expired' END,
+		     invalidated_at = CASE WHEN expire_reason = 'auto_reset' THEN now() ELSE invalidated_at END
+		 WHERE email_sent_at IS NOT NULL
+		   AND used_at IS NULL
+		   AND status = 'email_sent'
+		   AND expires_at <= now()`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (p *Postgres) HasActiveConfirmToken(ctx context.Context) (bool, error) {
+	if _, err := p.ExpireAutoResetInvalidatedConfirmTokens(ctx); err != nil {
+		return false, err
+	}
 	var exists bool
 	err := p.db.QueryRowContext(ctx,
 		`SELECT EXISTS (
@@ -192,6 +233,9 @@ func (p *Postgres) MarkConfirmTokenEmailSent(ctx context.Context, tokenHash stri
 }
 
 func (p *Postgres) ConsumeConfirmToken(ctx context.Context, tokenHash string) (ConfirmToken, error) {
+	if _, err := p.ExpireAutoResetInvalidatedConfirmTokens(ctx); err != nil {
+		return ConfirmToken{}, err
+	}
 	var token ConfirmToken
 	err := p.db.QueryRowContext(ctx,
 		`UPDATE confirm_tokens

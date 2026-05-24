@@ -47,16 +47,18 @@ func TestSmokeLocalConfigAndPostgresSchema(t *testing.T) {
 	}
 
 	requiredColumns := map[string]bool{
-		"status":        false,
-		"cancelled_at":  false,
-		"email_sent_at": false,
+		"status":         false,
+		"cancelled_at":   false,
+		"email_sent_at":  false,
+		"invalidated_at": false,
+		"expire_reason":  false,
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT column_name
 		FROM information_schema.columns
 		WHERE table_schema = current_schema()
 		  AND table_name = 'confirm_tokens'
-		  AND column_name IN ('status', 'cancelled_at', 'email_sent_at')`)
+		  AND column_name IN ('status', 'cancelled_at', 'email_sent_at', 'invalidated_at', 'expire_reason')`)
 	if err != nil {
 		t.Fatalf("query confirm_tokens columns: %v", err)
 	}
