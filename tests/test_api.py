@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
+import socket
 import unittest
+import urllib.error
 import urllib.request
 
-from auto_reset_remaining.api import APIClient, APIError, parse_balance
+from auto_reset_remaining.api import APIClient, APIError, APINetworkError, parse_balance
 from auto_reset_remaining.config import AppConfig, CodexConfig, LogsConfig, PollingConfig, RayPlusConfig, ResetConfig, SQLiteConfig
 
 
@@ -46,6 +48,14 @@ class FakeOpener:
         raise AssertionError(f"unexpected URL: {url}")
 
 
+class RaisingOpener:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def open(self, request: urllib.request.Request, timeout: float) -> FakeResponse:
+        raise self.exc
+
+
 class APITests(unittest.TestCase):
     def test_parse_balance_paths(self) -> None:
         self.assertEqual(parse_balance({"data": {"balance": "1.25"}}), 1.25)
@@ -64,6 +74,39 @@ class APITests(unittest.TestCase):
         self.assertEqual(reset.subscription_id, 42)
         self.assertTrue(reset.success)
         self.assertEqual(len(opener.requests), 4)
+
+    def test_network_failures_are_classified_for_quiet_balance_handling(self) -> None:
+        cases = [
+            TimeoutError("timed out"),
+            socket.timeout("timed out"),
+            urllib.error.URLError(socket.gaierror("name lookup failed")),
+        ]
+        for exc in cases:
+            with self.subTest(exc=type(exc).__name__):
+                client = APIClient(_config(), opener=RaisingOpener(exc))
+
+                with self.assertRaises(APINetworkError):
+                    client.query_balance()
+
+    def test_http_and_parse_errors_remain_regular_api_errors(self) -> None:
+        http_client = APIClient(_config(), opener=HTTPStatusOpener(500, {"error": "server"}))
+        with self.assertRaises(APIError) as http_error:
+            http_client.query_balance()
+        self.assertNotIsInstance(http_error.exception, APINetworkError)
+
+        parse_client = APIClient(_config(), opener=HTTPStatusOpener(200, {"data": {"balance": "abc"}}))
+        with self.assertRaises(APIError) as parse_error:
+            parse_client.query_balance()
+        self.assertNotIsInstance(parse_error.exception, APINetworkError)
+
+
+class HTTPStatusOpener:
+    def __init__(self, status: int, payload: Any) -> None:
+        self.status = status
+        self.payload = payload
+
+    def open(self, request: urllib.request.Request, timeout: float) -> FakeResponse:
+        return FakeResponse(self.status, self.payload)
 
 
 def _config() -> AppConfig:

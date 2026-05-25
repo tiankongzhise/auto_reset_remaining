@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import socket
 from typing import Any, Protocol
 import urllib.error
 import urllib.request
@@ -32,6 +33,10 @@ DEFAULT_BALANCE_PATHS = [
 
 
 class APIError(RuntimeError):
+    pass
+
+
+class APINetworkError(APIError):
     pass
 
 
@@ -216,7 +221,9 @@ class APIClient:
             response_body = exc.read()
             raise APIError(f"HTTP {exc.code}: {_summarize(response_body)}") from exc
         except urllib.error.URLError as exc:
-            raise APIError(f"请求失败：{exc.reason}") from exc
+            raise APINetworkError(f"请求失败：{exc.reason}") from exc
+        except (TimeoutError, socket.timeout, OSError) as exc:
+            raise APINetworkError(f"请求失败：{exc}") from exc
         if status < 200 or status >= 300:
             raise APIError(f"HTTP {status}: {_summarize(response_body)}")
         return HTTPResult(status=status, body=response_body)

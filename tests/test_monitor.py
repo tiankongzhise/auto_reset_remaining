@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from auto_reset_remaining.api import BalanceResult, ResetResult
+from auto_reset_remaining.api import APINetworkError, BalanceResult, ResetResult
 from auto_reset_remaining.config import (
     AppConfig,
     CodexConfig,
@@ -14,7 +15,13 @@ from auto_reset_remaining.config import (
     ResetConfig,
     SQLiteConfig,
 )
-from auto_reset_remaining.monitor import CONFIRM_RESULT_CANCELLED, CONFIRM_RESULT_CONFIRMED, Monitor, MonitorEvent
+from auto_reset_remaining.monitor import (
+    BALANCE_QUERY_NETWORK_ERROR_STATUS,
+    CONFIRM_RESULT_CANCELLED,
+    CONFIRM_RESULT_CONFIRMED,
+    Monitor,
+    MonitorEvent,
+)
 from auto_reset_remaining.query_log import QueryLogger
 from auto_reset_remaining.store import SQLiteStore
 
@@ -30,6 +37,18 @@ class FakeAPI:
     def reset_quota(self) -> ResetResult:
         self.reset_calls += 1
         return ResetResult(subscription_id=99, http_status=200, response_summary="{}", success=True)
+
+
+class FlakyAPI(FakeAPI):
+    def __init__(self, outcomes: list[float | Exception]) -> None:
+        super().__init__([])
+        self.outcomes = outcomes
+
+    def query_balance(self) -> BalanceResult:
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return BalanceResult(balance=outcome, raw={})
 
 
 class MonitorTests(unittest.TestCase):
@@ -145,6 +164,58 @@ class MonitorTests(unittest.TestCase):
 
             self.assertEqual(status, "balance_query_paused")
             self.assertEqual(api.reset_calls, 0)
+            store.close()
+
+    def test_balance_query_network_error_is_logged_without_error_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), auto_reset_enabled=False)
+            store = SQLiteStore(config.sqlite.path)
+            store.init()
+            api = FlakyAPI([APINetworkError("timed out")])
+            events: list[MonitorEvent] = []
+            monitor = Monitor(
+                config,
+                api,  # type: ignore[arg-type]
+                store,
+                QueryLogger(config.logs.query_log_dir),
+                event_callback=events.append,
+            )
+
+            status = monitor.tick_once()
+            logs = list(config.logs.query_log_dir.glob("query-*.jsonl"))
+            payload = json.loads(logs[0].read_text(encoding="utf-8").strip())
+
+            self.assertEqual(status, BALANCE_QUERY_NETWORK_ERROR_STATUS)
+            self.assertEqual(payload["status"], BALANCE_QUERY_NETWORK_ERROR_STATUS)
+            self.assertIn("timed out", payload["error"])
+            self.assertFalse(any(event.kind == "error" for event in events))
+            self.assertTrue(any(event.status == BALANCE_QUERY_NETWORK_ERROR_STATUS for event in events))
+            store.close()
+
+    def test_balance_query_recovers_after_network_error_on_next_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp), auto_reset_enabled=False)
+            store = SQLiteStore(config.sqlite.path)
+            store.init()
+            api = FlakyAPI([APINetworkError("timed out"), 1.0])
+            events: list[MonitorEvent] = []
+            monitor = Monitor(
+                config,
+                api,  # type: ignore[arg-type]
+                store,
+                QueryLogger(config.logs.query_log_dir),
+                event_callback=events.append,
+            )
+
+            first_status = monitor.tick_once()
+            second_status = monitor.tick_once()
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(first_status, BALANCE_QUERY_NETWORK_ERROR_STATUS)
+            self.assertEqual(second_status, "ok")
+            self.assertEqual(snapshot.last_balance, 1.0)
+            self.assertIsNone(snapshot.last_error)
+            self.assertTrue(any(event.status == "ok" for event in events))
             store.close()
 
 

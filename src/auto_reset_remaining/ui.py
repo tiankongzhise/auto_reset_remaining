@@ -9,7 +9,13 @@ from tkinter import ttk
 
 from auto_reset_remaining.api import APIClient
 from auto_reset_remaining.config import AppConfig
-from auto_reset_remaining.monitor import CONFIRM_RESULT_CANCELLED, CONFIRM_RESULT_CONFIRMED, Monitor, MonitorEvent
+from auto_reset_remaining.monitor import (
+    CONFIRM_RESULT_CANCELLED,
+    CONFIRM_RESULT_CONFIRMED,
+    BalanceQueryNetworkError,
+    Monitor,
+    MonitorEvent,
+)
 from auto_reset_remaining.query_log import QueryLogger
 from auto_reset_remaining.store import SQLiteStore
 
@@ -99,6 +105,8 @@ class MainWindow:
         try:
             result = self.monitor.manual_reset()
             self.events.put(MonitorEvent("info", f"手动重置成功，订阅 ID {result.subscription_id}", status="manual_reset_success"))
+        except BalanceQueryNetworkError:
+            pass
         except Exception as exc:
             self.events.put(MonitorEvent("error", f"手动重置失败：{exc}", status="manual_reset_error"))
 

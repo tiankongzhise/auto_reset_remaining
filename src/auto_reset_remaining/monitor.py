@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Callable, Protocol
 
-from auto_reset_remaining.api import APIClient, APIError, BalanceResult, ResetResult
+from auto_reset_remaining.api import APIClient, APIError, APINetworkError, BalanceResult, ResetResult
 from auto_reset_remaining.config import AppConfig, is_time_in_manual_confirm_range, update_runtime_state
 from auto_reset_remaining.query_log import QueryLogEntry, QueryLogger
 from auto_reset_remaining.store import SQLiteStore
@@ -16,6 +16,7 @@ from auto_reset_remaining.store import SQLiteStore
 
 CONFIRM_RESULT_CONFIRMED = "confirmed"
 CONFIRM_RESULT_CANCELLED = "cancelled"
+BALANCE_QUERY_NETWORK_ERROR_STATUS = "balance_query_network_error"
 
 
 class ConfirmCallback(Protocol):
@@ -45,6 +46,10 @@ class MonitorSnapshot:
 
 
 class ResetInProgress(RuntimeError):
+    pass
+
+
+class BalanceQueryNetworkError(RuntimeError):
     pass
 
 
@@ -122,6 +127,11 @@ class Monitor:
         try:
             status, balance = self._tick()
             return status
+        except BalanceQueryNetworkError as exc:
+            error = exc
+            status = BALANCE_QUERY_NETWORK_ERROR_STATUS
+            self._handle_balance_query_network_error(exc, status)
+            return status
         except Exception as exc:
             error = exc
             status = "error"
@@ -144,7 +154,22 @@ class Monitor:
 
     def manual_reset(self, balance: float | None = None) -> ResetResult:
         if balance is None:
-            result = self.api_client.query_balance()
+            started = datetime.now()
+            try:
+                result = self.api_client.query_balance()
+            except APINetworkError as exc:
+                wrapped = BalanceQueryNetworkError(str(exc))
+                self._handle_balance_query_network_error(wrapped, BALANCE_QUERY_NETWORK_ERROR_STATUS)
+                duration_ms = int((datetime.now() - started).total_seconds() * 1000)
+                self.query_logger.log(
+                    QueryLogEntry(
+                        time=started,
+                        status=BALANCE_QUERY_NETWORK_ERROR_STATUS,
+                        duration_ms=duration_ms,
+                        error=str(wrapped),
+                    )
+                )
+                raise wrapped from exc
             balance = result.balance
         return self._execute_reset("manual", balance).result
 
@@ -162,7 +187,10 @@ class Monitor:
                 self._status = "今日已暂停查询"
             return "balance_query_paused", None
 
-        balance_result = self.api_client.query_balance()
+        try:
+            balance_result = self.api_client.query_balance()
+        except APINetworkError as exc:
+            raise BalanceQueryNetworkError(str(exc)) from exc
         balance = balance_result.balance
         with self._lock:
             self._last_balance = balance
@@ -289,6 +317,13 @@ class Monitor:
         if self._last_auto_reset_at is None:
             return False
         return (now - self._last_auto_reset_at).total_seconds() < self.config.reset.cooldown_seconds
+
+    def _handle_balance_query_network_error(self, exc: Exception, status: str) -> None:
+        message = f"余额查询网络异常，已记录日志并等待下次重试：{exc}"
+        with self._lock:
+            self._last_error = str(exc)
+            self._status = status
+        self._emit("status", message, status=status)
 
     def _replace_runtime_state(self, manual_count: int, auto_enabled: bool) -> AppConfig:
         reset = self.config.reset
