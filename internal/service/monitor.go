@@ -480,11 +480,13 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 	rawToken, tokenHash, err := newConfirmToken()
 	if err != nil {
 		m.logger.Printf("confirm email token creation failed status_prefix=%s balance=%.6f error=%v", statusPrefix, balance, err)
+		m.notifyConfirmURLFailure(ctx, cfg, balance, statusPrefix, "confirm token creation failed", err)
 		return ResendConfirmEmailResult{Balance: balance, Status: "confirm_token_error"}, err
 	}
 	expiresAt, expireReason := confirmTokenExpiresAt(time.Now(), cfg.ConfirmTokenTTL)
 	if err := m.store.CreateConfirmToken(ctx, tokenHash, balance, expiresAt, expireReason); err != nil {
 		m.logger.Printf("confirm email token store failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
+		m.notifyConfirmURLFailure(ctx, cfg, balance, statusPrefix, "confirm token store failed", err)
 		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_store_error"}, err
 	}
 
@@ -504,6 +506,7 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		m.syncPendingManualEmail(ctx, statusPrefix, balance)
 		m.logger.Printf("confirm email sent token state failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v",
 			statusPrefix, balance, tokenHashPrefix(tokenHash), err)
+		m.notifyConfirmURLFailure(ctx, cfg, balance, statusPrefix, "confirm token email state update failed", err)
 		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_email_state_error"}, err
 	}
 	invalidated, err := m.store.DeleteOtherActiveConfirmTokens(ctx, tokenHash)
@@ -512,6 +515,7 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		m.syncPendingManualEmail(ctx, statusPrefix, balance)
 		m.logger.Printf("confirm email old token invalidation failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v",
 			statusPrefix, balance, tokenHashPrefix(tokenHash), err)
+		m.notifyConfirmURLFailure(ctx, cfg, balance, statusPrefix, "old confirm token invalidation failed", err)
 		return ResendConfirmEmailResult{Balance: balance, ExpiresAt: expiresAt, Status: "confirm_token_invalidation_error"}, err
 	}
 
@@ -532,6 +536,18 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		Status:              statusPrefix + "_email_sent",
 		NextPollInterval:    policy.Interval.String(),
 	}, nil
+}
+
+func (m *Monitor) notifyConfirmURLFailure(ctx context.Context, cfg config.Config, balance float64, statusPrefix string, reason string, cause error) {
+	subject := "重置确认链接生成失败，需要手动处理"
+	body := fmt.Sprintf("当前余额已经触发重置确认流程，但服务未能生成可用的自动重置确认链接，需要手动处理。\n\n当前余额：%.6f\n低余额阈值：%.6f\n触发场景：%s\n失败原因：%s\n错误详情：%s\n\n请检查服务日志、数据库 confirm_tokens 表和相关配置，必要时手动重置订阅额度。\n",
+		balance, cfg.LowBalanceThreshold, statusPrefix, reason, summarizeError(cause))
+	if err := m.mailer.Send(ctx, subject, body); err != nil {
+		m.logger.Printf("confirm URL failure notification failed status_prefix=%s balance=%.6f reason=%s original_error=%v notification_error=%v",
+			statusPrefix, balance, reason, cause, err)
+		return
+	}
+	m.logger.Printf("confirm URL failure notification sent status_prefix=%s balance=%.6f reason=%s", statusPrefix, balance, reason)
 }
 
 func (m *Monitor) maybeAutoReset(ctx context.Context, balance float64, cooldown time.Duration) (string, error) {
@@ -1130,6 +1146,17 @@ func formatEmailTime(t time.Time) string {
 		return ""
 	}
 	return t.Format("2006-01-02 15:04:05 MST")
+}
+
+func summarizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	if len(text) <= 500 {
+		return text
+	}
+	return text[:500] + "..."
 }
 
 func confirmURL(baseURL, rawToken string) string {

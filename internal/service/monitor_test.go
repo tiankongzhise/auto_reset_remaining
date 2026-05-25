@@ -562,6 +562,69 @@ func TestFailedConfirmEmailClearsPendingAndCanRetry(t *testing.T) {
 	}
 }
 
+func TestConfirmTokenStoreFailureSendsManualHandlingAlert(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0}
+	storeErr := errors.New("duplicate key value violates unique constraint")
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	dataStore.createErr = storeErr
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("Tick() error = %v, want %v", err, storeErr)
+	}
+	if status != "confirm_token_store_error" {
+		t.Fatalf("Tick() status = %s, want confirm_token_store_error", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages = %d, want one alert", got)
+	}
+	if !strings.Contains(sender.messages[0], "重置确认链接生成失败") || !strings.Contains(sender.messages[0], "0.000000") || !strings.Contains(sender.messages[0], "duplicate key") {
+		t.Fatalf("manual handling alert missing balance or reason:\n%s", sender.messages[0])
+	}
+}
+
+func TestConfirmURLFailureAlertErrorKeepsOriginalError(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0}
+	storeErr := errors.New("duplicate token hash")
+	notifyErr := errors.New("smtp unavailable")
+	sender := &fakeMailer{err: notifyErr}
+	dataStore := newFakeStore()
+	dataStore.createErr = storeErr
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("Tick() error = %v, want original store error %v", err, storeErr)
+	}
+	if status != "confirm_token_store_error" {
+		t.Fatalf("Tick() status = %s, want confirm_token_store_error", status)
+	}
+}
+
+func TestConfirmEmailSMTPFailureDoesNotSendSecondAlert(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sendErr := errors.New("smtp auth failed")
+	sender := &fakeMailer{err: sendErr}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("Tick() error = %v, want %v", err, sendErr)
+	}
+	if status != "low_balance_email_error" {
+		t.Fatalf("Tick() status = %s, want low_balance_email_error", status)
+	}
+	if sender.sendAttempts != 1 {
+		t.Fatalf("send attempts = %d, want only original confirm email attempt", sender.sendAttempts)
+	}
+}
+
 func TestAutoModeResetsWhenBalanceIsZero(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
@@ -982,13 +1045,15 @@ func (f *fakeAPI) ResetQuota(context.Context) (api.ResetResult, error) {
 }
 
 type fakeMailer struct {
-	messages []string
-	html     []string
-	err      error
-	configs  []config.SMTPConfig
+	messages     []string
+	html         []string
+	err          error
+	configs      []config.SMTPConfig
+	sendAttempts int
 }
 
 func (f *fakeMailer) Send(_ context.Context, subject string, body string) error {
+	f.sendAttempts++
 	if f.err != nil {
 		return f.err
 	}
@@ -997,6 +1062,7 @@ func (f *fakeMailer) Send(_ context.Context, subject string, body string) error 
 }
 
 func (f *fakeMailer) SendHTML(_ context.Context, subject string, plainBody string, htmlBody string) error {
+	f.sendAttempts++
 	if f.err != nil {
 		return f.err
 	}
@@ -1011,10 +1077,13 @@ func (f *fakeMailer) SetConfig(cfg config.SMTPConfig) {
 }
 
 type fakeStore struct {
-	tokens    map[string]fakeToken
-	resetLogs []store.ResetLog
-	daily     map[string]*fakeDailyState
-	nextID    int64
+	tokens                    map[string]fakeToken
+	resetLogs                 []store.ResetLog
+	daily                     map[string]*fakeDailyState
+	nextID                    int64
+	createErr                 error
+	markEmailSentErr          error
+	deleteOtherActiveTokenErr error
 }
 
 type fakeToken struct {
@@ -1042,6 +1111,9 @@ func (f *fakeStore) Init(context.Context) error {
 }
 
 func (f *fakeStore) CreateConfirmToken(_ context.Context, tokenHash string, balance float64, expiresAt time.Time, expireReason store.ConfirmTokenExpireReason) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
 	if expireReason == "" {
 		expireReason = store.ConfirmTokenExpireReasonTTL
 	}
@@ -1056,6 +1128,9 @@ func (f *fakeStore) DeleteConfirmToken(_ context.Context, tokenHash string) erro
 }
 
 func (f *fakeStore) DeleteOtherActiveConfirmTokens(_ context.Context, keepTokenHash string) (int64, error) {
+	if f.deleteOtherActiveTokenErr != nil {
+		return 0, f.deleteOtherActiveTokenErr
+	}
 	var deleted int64
 	now := time.Now()
 	for tokenHash, token := range f.tokens {
@@ -1130,6 +1205,9 @@ func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
 }
 
 func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash string) error {
+	if f.markEmailSentErr != nil {
+		return f.markEmailSentErr
+	}
 	token, ok := f.tokens[tokenHash]
 	if !ok || token.used || token.cancelled || token.expired || token.expiresAt.Before(time.Now()) {
 		return store.ErrTokenInvalid
