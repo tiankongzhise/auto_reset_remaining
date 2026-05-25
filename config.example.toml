@@ -1,30 +1,67 @@
 [rayplus]
+# RayPlus API 基础地址；通常保持默认值即可。
 base_url = "https://rayplus.site"
+
+# RayPlus API Key，用于查询当前额度或余额；请替换为自己的 sk- 开头密钥。
 api_key = "sk-your-api-key"
+
+# RayPlus 登录邮箱；程序会用它登录并获取 Codex 重置接口所需的访问令牌。
 email = "you@example.com"
+
+# RayPlus 登录密码；仅保存在本地 config.toml 中，不会提交到 Git。
 password = "your-password"
+
+# 请求 RayPlus/Codex 接口时发送的 User-Agent，便于服务端识别来源。
 user_agent = "auto-reset-remaining-python/0.1"
+
+# 余额字段的 JSON 路径；留空时程序会自动尝试常见字段，例如 data.balance。
 balance_json_path = ""
 
+
 [codex]
+# Codex 订阅接口基础地址；通常保持默认值即可。
 base_url = "https://codex.rayplus.site"
+
+# 要重置的订阅 ID；填 0 表示自动选择 active 且可重置的订阅。
 subscription_id = 0
 
+
 [sqlite]
+# 本地 SQLite 数据库文件路径，用于保存确认请求、重置日志和每日限制状态。
 path = "data/auto_reset_remaining.sqlite3"
 
+
 [reset]
+# 低余额阈值；未开启自动重置时，余额低于该值会弹窗请求确认。
 low_balance_threshold = 0.5
+
+# 是否启用自动重置；开启后余额小于等于 0 时会自动重置。
 auto_reset_enabled = false
+
+# 人工确认重置成功次数；累计达到 3 次后程序会自动开启 auto_reset_enabled。
 manual_confirm_success_count = 0
+
+# 每日最大成功重置次数；0 表示不限制。
 daily_max_reset_count = 0
+
+# 低余额确认请求有效期；支持 ms、s、m、h，例如 30m、1h、24h。
 confirm_request_ttl = "24h"
+
+# 自动重置冷却时间；避免余额持续为 0 时频繁重复重置。
 cooldown = "1m"
+
+# 强制人工确认的本地时间段；留空表示不启用，例如 "22:00-09:00"。
 manual_confirm_time_range = ""
 
+
 [polling]
+# 默认余额查询间隔；支持 ms、s、m、h，例如 10s、1m。
 default_interval = "10s"
+
+# 判断余额是否发生真实变化的最小差值，用于过滤浮点误差。
 balance_change_epsilon = 0.000001
 
+
 [logs]
+# 查询日志目录；程序会按日期写入 query-YYYY-MM-DD.jsonl。
 query_log_dir = "logs"
