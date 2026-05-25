@@ -1,8 +1,9 @@
 """Application entrypoint."""
 
 from auto_reset_remaining.config_ui import confirm_config_on_startup
+from auto_reset_remaining.ui import run_main_window
 
 
 def main() -> None:
     config = confirm_config_on_startup()
-    print(f"配置已确认：SQLite={config.sqlite.path}，日志目录={config.logs.query_log_dir}")
+    run_main_window(config)
