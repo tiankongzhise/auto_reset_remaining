@@ -27,7 +27,8 @@ func TestRotateLogsHTTPHandler(t *testing.T) {
 		LogRotationArchiveDir: archiveDir,
 		LogRotationKey:        "secret",
 	}, NewQueryLogger(sourceDir), nil)
-	handler := NewHTTPHandler(nil, rotator)
+	monitor := newTestMonitor(t, &fakeAPI{}, &fakeMailer{}, newFakeStore(), config.Config{})
+	handler := NewHTTPHandler(monitor, rotator)
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/rotate-logs?key=wrong", nil)
@@ -37,7 +38,7 @@ func TestRotateLogsHTTPHandler(t *testing.T) {
 	}
 
 	recorder = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodGet, "/rotate-logs?key=secret", nil)
+	request = httptest.NewRequest(http.MethodGet, "/rotate-logs?key=secret&replay_nonce=1", nil)
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("rotate status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -71,7 +72,7 @@ func TestResendResetEmailHTTPHandler(t *testing.T) {
 	}
 
 	recorder = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=resend-secret", nil)
+	request = httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=resend-secret&replay_nonce=1", nil)
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("resend status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -85,6 +86,16 @@ func TestResendResetEmailHTTPHandler(t *testing.T) {
 	}
 	if len(sender.messages) != 1 {
 		t.Fatalf("sent messages = %d, want 1", len(sender.messages))
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=resend-secret&replay_nonce=1", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("replay status = %d, want %d", recorder.Code, http.StatusConflict)
+	}
+	if apiClient.balanceCalls != 1 {
+		t.Fatalf("balanceCalls after replay = %d, want 1", apiClient.balanceCalls)
 	}
 }
 
@@ -106,7 +117,7 @@ func TestManualResetHTTPHandler(t *testing.T) {
 	}
 
 	recorder = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodGet, "/manual-reset-subscription?key=manual-secret", nil)
+	request = httptest.NewRequest(http.MethodGet, "/manual-reset-subscription?key=manual-secret&replay_nonce=1", nil)
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("manual reset status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -130,7 +141,7 @@ func TestTestResetEmailHTTPHandler(t *testing.T) {
 	handler := NewHTTPHandler(monitor, nil)
 
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/test-reset-email?key=test-secret", nil)
+	request := httptest.NewRequest(http.MethodGet, "/test-reset-email?key=test-secret&replay_nonce=1", nil)
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("test reset email status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -158,7 +169,7 @@ func TestCancelResetEmailsHTTPHandler(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/cancel-reset-emails?key=cancel-secret", nil)
+	request := httptest.NewRequest(http.MethodGet, "/cancel-reset-emails?key=cancel-secret&replay_nonce=1", nil)
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("cancel status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -169,6 +180,76 @@ func TestCancelResetEmailsHTTPHandler(t *testing.T) {
 	}
 	if result.Cancelled != 1 || result.Status != "reset_emails_cancelled" {
 		t.Fatalf("result = %+v, want one cancelled", result)
+	}
+}
+
+func TestKeyHTTPHandlersRequireReplayNonce(t *testing.T) {
+	sourceDir := filepath.Join(t.TempDir(), "logs")
+	archiveDir := filepath.Join(t.TempDir(), "archives")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rotator := NewLogRotator(config.Config{
+		QueryLogDir:           sourceDir,
+		LogRotationEnabled:    true,
+		LogRotationArchiveDir: archiveDir,
+		LogRotationKey:        "rotate-secret",
+	}, NewQueryLogger(sourceDir), nil)
+	monitor := newTestMonitor(t, &fakeAPI{balance: 0.4}, &fakeMailer{}, newFakeStore(), config.Config{
+		ResendResetEmailKey:        "resend-secret",
+		ExternalManualResetEnabled: true,
+		ExternalManualResetKey:     "manual-secret",
+		TestResetEmailKey:          "test-secret",
+		CancelResetEmailKey:        "cancel-secret",
+	})
+	handler := NewHTTPHandler(monitor, rotator)
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{name: "resend", path: "/resend-reset-email?key=resend-secret"},
+		{name: "manual", path: "/manual-reset-subscription?key=manual-secret"},
+		{name: "test", path: "/test-reset-email?key=test-secret"},
+		{name: "cancel", path: "/cancel-reset-emails?key=cancel-secret"},
+		{name: "rotate", path: "/rotate-logs?key=rotate-secret"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestWrongKeyDoesNotConsumeReplayNonce(t *testing.T) {
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ResendResetEmailKey: "resend-secret",
+	})
+	handler := NewHTTPHandler(monitor, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=wrong&replay_nonce=1", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong key status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	if dataStore.replayNonceUsed("/resend-reset-email", "1") {
+		t.Fatal("wrong key consumed replay nonce")
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/resend-reset-email?key=resend-secret&replay_nonce=1", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("correct key status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 }
 

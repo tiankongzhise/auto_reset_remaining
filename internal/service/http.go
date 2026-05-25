@@ -17,6 +17,8 @@ import (
 var (
 	ErrReplayNonceEndpointInvalid = errors.New("unsupported replay nonce endpoint")
 	ErrReplayNonceStoreMissing    = errors.New("replay nonce store is not configured")
+	ErrReplayNonceMissing         = errors.New("replay_nonce is required")
+	ErrReplayNonceInvalid         = errors.New("replay_nonce must be a positive integer")
 )
 
 type ReplayNonceResult struct {
@@ -109,6 +111,14 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
+		if err := validateResendResetEmailKey(monitor, rotator, r.URL.Query().Get("key")); err != nil {
+			http.Error(w, err.Error(), replayKeyHTTPStatus(err))
+			return
+		}
+		if err := requireReplayNonce(ctx, monitor, "/resend-reset-email", r.URL.Query().Get("replay_nonce")); err != nil {
+			http.Error(w, err.Error(), replayNonceHTTPStatus(err))
+			return
+		}
 		result, err := monitor.ResendConfirmEmail(ctx, r.URL.Query().Get("key"))
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -133,6 +143,14 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
+		if err := validateManualResetKey(monitor, rotator, r.URL.Query().Get("key")); err != nil {
+			http.Error(w, err.Error(), replayKeyHTTPStatus(err))
+			return
+		}
+		if err := requireReplayNonce(ctx, monitor, "/manual-reset-subscription", r.URL.Query().Get("replay_nonce")); err != nil {
+			http.Error(w, err.Error(), replayNonceHTTPStatus(err))
+			return
+		}
 		result, err := monitor.ManualReset(ctx, r.URL.Query().Get("key"))
 		if err != nil {
 			http.Error(w, err.Error(), manualResetHTTPStatus(err))
@@ -153,6 +171,14 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
+		if err := validateTestResetEmailKey(monitor, rotator, r.URL.Query().Get("key")); err != nil {
+			http.Error(w, err.Error(), replayKeyHTTPStatus(err))
+			return
+		}
+		if err := requireReplayNonce(ctx, monitor, "/test-reset-email", r.URL.Query().Get("replay_nonce")); err != nil {
+			http.Error(w, err.Error(), replayNonceHTTPStatus(err))
+			return
+		}
 		result, err := monitor.TestResetEmail(ctx, r.URL.Query().Get("key"))
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -177,6 +203,14 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
+		if err := validateCancelResetEmailKey(monitor, rotator, r.URL.Query().Get("key")); err != nil {
+			http.Error(w, err.Error(), replayKeyHTTPStatus(err))
+			return
+		}
+		if err := requireReplayNonce(ctx, monitor, "/cancel-reset-emails", r.URL.Query().Get("replay_nonce")); err != nil {
+			http.Error(w, err.Error(), replayNonceHTTPStatus(err))
+			return
+		}
 		result, err := monitor.CancelResetEmails(ctx, r.URL.Query().Get("key"))
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -196,6 +230,14 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		}
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := validateLogRotationKey(monitor, rotator, r.URL.Query().Get("key")); err != nil {
+			http.Error(w, err.Error(), replayKeyHTTPStatus(err))
+			return
+		}
+		if err := requireReplayNonce(r.Context(), monitor, "/rotate-logs", r.URL.Query().Get("replay_nonce")); err != nil {
+			http.Error(w, err.Error(), replayNonceHTTPStatus(err))
 			return
 		}
 		result, err := rotator.RotateWithKey(r.URL.Query().Get("key"))
@@ -333,11 +375,36 @@ func replayKeyHTTPStatus(err error) int {
 func normalizeReplayNonce(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errors.New("replay_nonce is required")
+		return "", ErrReplayNonceMissing
 	}
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value <= 0 {
-		return "", errors.New("replay_nonce must be a positive integer")
+		return "", ErrReplayNonceInvalid
 	}
 	return strconv.FormatInt(value, 10), nil
+}
+
+func requireReplayNonce(ctx context.Context, monitor *Monitor, endpoint string, rawReplayNonce string) error {
+	replayNonce, err := normalizeReplayNonce(rawReplayNonce)
+	if err != nil {
+		return err
+	}
+	replayStore := replayNonceStore(monitor)
+	if replayStore == nil {
+		return ErrReplayNonceStoreMissing
+	}
+	return replayStore.ConsumeReplayNonce(ctx, endpoint, replayNonce)
+}
+
+func replayNonceHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, store.ErrReplayNonceConsumed):
+		return http.StatusConflict
+	case errors.Is(err, ErrReplayNonceMissing), errors.Is(err, ErrReplayNonceInvalid):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrReplayNonceStoreMissing):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
 }
