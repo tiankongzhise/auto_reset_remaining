@@ -96,6 +96,16 @@ class SQLiteStore:
                 balance_query_paused INTEGER NOT NULL DEFAULT 0
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS confirm_prompt_suppression (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                suppressed INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                balance REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                cleared_at TEXT
+            )
+            """,
         ]
         with self._connection:
             for statement in statements:
@@ -187,18 +197,58 @@ class SQLiteStore:
                 (reset_log_id, manual_success_count_after, request_id),
             )
 
-    def cancel_pending_confirm_requests(self) -> int:
+    def cancel_pending_confirm_requests(self, status: str = "cancelled") -> int:
         now = utc_now()
         with self._connection:
             cursor = self._connection.execute(
                 """
                 UPDATE confirm_requests
-                SET status = 'cancelled', cancelled_at = ?
+                SET status = ?, cancelled_at = ?
                 WHERE status = 'pending'
+                """,
+                (status, _format_dt(now)),
+            )
+        return cursor.rowcount
+
+    def suppress_confirm_prompt(self, reason: str, balance: float) -> None:
+        now = utc_now()
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO confirm_prompt_suppression
+                    (id, suppressed, reason, balance, created_at, cleared_at)
+                VALUES (1, 1, ?, ?, ?, NULL)
+                ON CONFLICT(id) DO UPDATE SET
+                    suppressed = 1,
+                    reason = excluded.reason,
+                    balance = excluded.balance,
+                    created_at = excluded.created_at,
+                    cleared_at = NULL
+                """,
+                (reason, balance, _format_dt(now)),
+            )
+
+    def is_confirm_prompt_suppressed(self) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT suppressed
+            FROM confirm_prompt_suppression
+            WHERE id = 1
+            """
+        ).fetchone()
+        return bool(row and row["suppressed"])
+
+    def clear_confirm_prompt_suppression(self) -> None:
+        now = utc_now()
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE confirm_prompt_suppression
+                SET suppressed = 0, cleared_at = ?
+                WHERE id = 1
                 """,
                 (_format_dt(now),),
             )
-        return cursor.rowcount
 
     def expire_pending_confirm_requests(self) -> int:
         now = utc_now()

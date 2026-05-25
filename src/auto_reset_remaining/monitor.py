@@ -14,8 +14,12 @@ from auto_reset_remaining.query_log import QueryLogEntry, QueryLogger
 from auto_reset_remaining.store import SQLiteStore
 
 
+CONFIRM_RESULT_CONFIRMED = "confirmed"
+CONFIRM_RESULT_CANCELLED = "cancelled"
+
+
 class ConfirmCallback(Protocol):
-    def __call__(self, balance: float, expires_at: datetime, reason: str) -> bool:
+    def __call__(self, balance: float, expires_at: datetime, reason: str) -> str:
         ...
 
 
@@ -197,25 +201,38 @@ class Monitor:
                 self._execute_reset("auto", balance)
                 self._last_auto_reset_at = now
                 return "auto_reset_success"
+            self.store.clear_confirm_prompt_suppression()
             return "ok"
 
         if balance < self.config.reset.low_balance_threshold:
             return self._maybe_request_manual_confirm(balance, "low_balance")
+        self.store.clear_confirm_prompt_suppression()
         return "ok"
 
     def _maybe_request_manual_confirm(self, balance: float, reason: str) -> str:
+        if self.store.is_confirm_prompt_suppressed():
+            return f"{reason}_manual_cancelled"
         if self.store.has_pending_confirm_request():
             return f"{reason}_confirm_pending"
         raw_token = secrets.token_urlsafe(32)
         token_hash = hash_token(raw_token)
         expires_at = datetime.now() + timedelta(seconds=self.config.reset.confirm_request_ttl_seconds)
         self.store.create_confirm_request(token_hash, balance, expires_at)
-        confirmed = False
-        if self.confirm_callback is not None:
-            confirmed = self.confirm_callback(balance, expires_at, reason)
-        if not confirmed:
+        if self.confirm_callback is None:
             self._emit("warning", "已创建低余额确认请求，等待用户在弹窗中确认", balance=balance, status="confirm_pending")
             return f"{reason}_confirm_pending"
+
+        confirm_result = self.confirm_callback(balance, expires_at, reason)
+        if confirm_result != CONFIRM_RESULT_CONFIRMED:
+            self.store.cancel_pending_confirm_requests("manual_cancelled")
+            self.store.suppress_confirm_prompt(reason, balance)
+            self._emit(
+                "warning",
+                "重置确认已经被手动取消，需要手动发起重置；在余额被重置前不会再重复弹窗提示。",
+                balance=balance,
+                status="manual_confirm_cancelled",
+            )
+            return "manual_confirm_cancelled"
 
         request = self.store.consume_confirm_request(token_hash)
         executed = self._execute_reset("manual", request.balance)
@@ -245,6 +262,7 @@ class Monitor:
                 http_status=result.http_status,
                 response_summary=result.response_summary,
             )
+            self.store.clear_confirm_prompt_suppression()
             self._emit("info", f"订阅额度已重置，订阅 ID {result.subscription_id}", balance=balance, status=f"{mode}_reset_success")
             return ExecutedReset(result=result, log_id=log_id)
         except Exception as exc:

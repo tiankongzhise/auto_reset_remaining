@@ -41,6 +41,32 @@ class StoreTests(unittest.TestCase):
             self.assertFalse(store.has_pending_confirm_request())
             store.close()
 
+    def test_pending_confirm_request_can_be_manual_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "app.sqlite3")
+            store.init()
+            store.create_confirm_request("hash-1", 0.25, utc_now() + timedelta(minutes=5))
+
+            cancelled = store.cancel_pending_confirm_requests("manual_cancelled")
+
+            self.assertEqual(cancelled, 1)
+            self.assertFalse(store.has_pending_confirm_request())
+            with self.assertRaises(InvalidConfirmRequest):
+                store.consume_confirm_request("hash-1")
+            store.close()
+
+    def test_confirm_prompt_suppression_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "app.sqlite3")
+            store.init()
+
+            self.assertFalse(store.is_confirm_prompt_suppressed())
+            store.suppress_confirm_prompt("low_balance", 0.1)
+            self.assertTrue(store.is_confirm_prompt_suppressed())
+            store.clear_confirm_prompt_suppression()
+            self.assertFalse(store.is_confirm_prompt_suppressed())
+            store.close()
+
     def test_daily_reset_limit_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteStore(Path(tmp) / "app.sqlite3")

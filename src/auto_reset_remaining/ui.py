@@ -9,7 +9,7 @@ from tkinter import ttk
 
 from auto_reset_remaining.api import APIClient
 from auto_reset_remaining.config import AppConfig
-from auto_reset_remaining.monitor import Monitor, MonitorEvent
+from auto_reset_remaining.monitor import CONFIRM_RESULT_CANCELLED, CONFIRM_RESULT_CONFIRMED, Monitor, MonitorEvent
 from auto_reset_remaining.query_log import QueryLogger
 from auto_reset_remaining.store import SQLiteStore
 
@@ -102,8 +102,8 @@ class MainWindow:
         except Exception as exc:
             self.events.put(MonitorEvent("error", f"手动重置失败：{exc}", status="manual_reset_error"))
 
-    def _confirm_reset(self, balance: float, expires_at: datetime, reason: str) -> bool:
-        response_queue: queue.Queue[bool] = queue.Queue(maxsize=1)
+    def _confirm_reset(self, balance: float, expires_at: datetime, reason: str) -> str:
+        response_queue: queue.Queue[str] = queue.Queue(maxsize=1)
         self.events.put(("confirm", (balance, expires_at, reason, response_queue)))
         return response_queue.get()
 
@@ -127,7 +127,7 @@ class MainWindow:
             "是否现在重置订阅额度？"
         )
         confirmed = messagebox.askyesno("余额不足，请确认重置", message, parent=self.root)
-        response_queue.put(confirmed)
+        response_queue.put(CONFIRM_RESULT_CONFIRMED if confirmed else CONFIRM_RESULT_CANCELLED)
 
     def _handle_monitor_event(self, event: MonitorEvent) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
