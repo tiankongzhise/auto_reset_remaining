@@ -1,7 +1,7 @@
 [project]
 name = "auto-reset-remaining"
 version = "0.1.0"
-description = "Add your description here"
+description = "Windows local UI tool for monitoring RayPlus balance and resetting Codex quota"
 readme = "README.md"
 authors = [
     { name = "3700x", email = "tiankongzhise@163.com" }

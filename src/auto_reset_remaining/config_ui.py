@@ -149,10 +149,13 @@ def _document_from_variables(
 
 def _coerce_value(key: str, value: str) -> object:
     value = value.strip()
-    if key in {"subscription_id", "manual_confirm_success_count", "daily_max_reset_count"}:
-        return int(value or "0")
-    if key in {"low_balance_threshold", "balance_change_epsilon"}:
-        return float(value or "0")
+    try:
+        if key in {"subscription_id", "manual_confirm_success_count", "daily_max_reset_count"}:
+            return int(value or "0")
+        if key in {"low_balance_threshold", "balance_change_epsilon"}:
+            return float(value or "0")
+    except ValueError as exc:
+        raise ConfigError(f"{key} 必须填写数字") from exc
     if key == "auto_reset_enabled":
         return value.lower() in {"true", "1", "yes", "y"}
     return value
