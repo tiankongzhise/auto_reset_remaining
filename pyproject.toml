@@ -7,7 +7,9 @@ authors = [
     { name = "3700x", email = "tiankongzhise@163.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "tomlkit>=0.15.0",
+]
 
 [project.scripts]
 auto-reset-remaining = "auto_reset_remaining:main"

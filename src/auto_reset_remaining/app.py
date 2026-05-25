@@ -1,9 +1,8 @@
-"""Application entrypoint.
+"""Application entrypoint."""
 
-The real UI and monitoring code is added in follow-up commits. Keeping this
-entrypoint tiny lets `uv run auto-reset-remaining` work from the first commit.
-"""
+from auto_reset_remaining.config_ui import confirm_config_on_startup
 
 
 def main() -> None:
-    print("auto-reset-remaining Python local edition")
+    config = confirm_config_on_startup()
+    print(f"配置已确认：SQLite={config.sqlite.path}，日志目录={config.logs.query_log_dir}")
