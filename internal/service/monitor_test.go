@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -846,6 +847,46 @@ func TestBalanceChangedUsesEpsilon(t *testing.T) {
 	}
 }
 
+func TestReplayNonceStoreSemantics(t *testing.T) {
+	ctx := context.Background()
+	dataStore := newFakeStore()
+
+	first, err := dataStore.NextReplayNonce(ctx, "/resend-reset-email")
+	if err != nil {
+		t.Fatalf("first NextReplayNonce() error = %v", err)
+	}
+	second, err := dataStore.NextReplayNonce(ctx, "/resend-reset-email")
+	if err != nil {
+		t.Fatalf("second NextReplayNonce() error = %v", err)
+	}
+	if first != "1" || second != "2" {
+		t.Fatalf("same scope nonces = %q, %q; want 1, 2", first, second)
+	}
+
+	other, err := dataStore.NextReplayNonce(ctx, "/rotate-logs")
+	if err != nil {
+		t.Fatalf("other scope NextReplayNonce() error = %v", err)
+	}
+	if other != "1" {
+		t.Fatalf("different scope nonce = %q, want 1", other)
+	}
+
+	if err := dataStore.ConsumeReplayNonce(ctx, "/resend-reset-email", first); err != nil {
+		t.Fatalf("ConsumeReplayNonce(first) error = %v", err)
+	}
+	if err := dataStore.ConsumeReplayNonce(ctx, "/resend-reset-email", first); !errors.Is(err, store.ErrReplayNonceConsumed) {
+		t.Fatalf("ConsumeReplayNonce(replay) error = %v, want ErrReplayNonceConsumed", err)
+	}
+
+	next, err := dataStore.NextReplayNonce(ctx, "/resend-reset-email")
+	if err != nil {
+		t.Fatalf("next after consumed error = %v", err)
+	}
+	if next != "3" {
+		t.Fatalf("next after consumed = %q, want 3", next)
+	}
+}
+
 func newTestMonitor(t *testing.T, apiClient *fakeAPI, sender *fakeMailer, dataStore *fakeStore, overrides config.Config) *Monitor {
 	t.Helper()
 	configPath := writeConfig(t, overrides.ManualConfirmSuccessCount, overrides.AutoResetEnabled)
@@ -1080,6 +1121,8 @@ type fakeStore struct {
 	tokens                    map[string]fakeToken
 	resetLogs                 []store.ResetLog
 	daily                     map[string]*fakeDailyState
+	replayNonces              map[string]map[string]bool
+	replayNonceCounters       map[string]int64
 	nextID                    int64
 	createErr                 error
 	markEmailSentErr          error
@@ -1103,7 +1146,13 @@ type fakeToken struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{tokens: make(map[string]fakeToken), daily: make(map[string]*fakeDailyState), nextID: 1}
+	return &fakeStore{
+		tokens:              make(map[string]fakeToken),
+		daily:               make(map[string]*fakeDailyState),
+		replayNonces:        make(map[string]map[string]bool),
+		replayNonceCounters: make(map[string]int64),
+		nextID:              1,
+	}
 }
 
 func (f *fakeStore) Init(context.Context) error {
@@ -1269,6 +1318,32 @@ func (f *fakeStore) MarkDailyLimitEmailSent(_ context.Context, day time.Time) er
 func (f *fakeStore) MarkPlanRefreshLimitEmailSent(_ context.Context, day time.Time) error {
 	f.dailyState(dayKey(day)).planRefreshLimitEmailSent = true
 	return nil
+}
+
+func (f *fakeStore) NextReplayNonce(_ context.Context, scope string) (string, error) {
+	for {
+		next := f.replayNonceCounters[scope] + 1
+		f.replayNonceCounters[scope] = next
+		candidate := fmt.Sprintf("%d", next)
+		if !f.replayNonceUsed(scope, candidate) {
+			return candidate, nil
+		}
+	}
+}
+
+func (f *fakeStore) ConsumeReplayNonce(_ context.Context, scope string, replayNonce string) error {
+	if f.replayNonceUsed(scope, replayNonce) {
+		return store.ErrReplayNonceConsumed
+	}
+	if f.replayNonces[scope] == nil {
+		f.replayNonces[scope] = make(map[string]bool)
+	}
+	f.replayNonces[scope][replayNonce] = true
+	return nil
+}
+
+func (f *fakeStore) replayNonceUsed(scope string, replayNonce string) bool {
+	return f.replayNonces[scope] != nil && f.replayNonces[scope][replayNonce]
 }
 
 type fakeDailyState struct {

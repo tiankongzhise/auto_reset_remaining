@@ -8,6 +8,7 @@ import (
 )
 
 var ErrTokenInvalid = errors.New("confirm token is invalid, expired, or already used")
+var ErrReplayNonceConsumed = errors.New("防重放参数已经被处理过")
 
 type ResetLog struct {
 	Mode            string
@@ -66,6 +67,8 @@ type Store interface {
 	GetDailyResetLimitState(ctx context.Context, day time.Time, maxResetCount int) (DailyResetLimitState, error)
 	MarkDailyLimitEmailSent(ctx context.Context, day time.Time) error
 	MarkPlanRefreshLimitEmailSent(ctx context.Context, day time.Time) error
+	NextReplayNonce(ctx context.Context, scope string) (string, error)
+	ConsumeReplayNonce(ctx context.Context, scope string, replayNonce string) error
 }
 
 type Postgres struct {
@@ -134,6 +137,17 @@ func (p *Postgres) Init(ctx context.Context) error {
 			day DATE PRIMARY KEY,
 			daily_limit_email_sent BOOLEAN NOT NULL DEFAULT false,
 			plan_refresh_limit_email_sent BOOLEAN NOT NULL DEFAULT false
+		)`,
+		`CREATE TABLE IF NOT EXISTS replay_nonces (
+			scope TEXT NOT NULL,
+			replay_nonce TEXT NOT NULL,
+			consumed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (scope, replay_nonce)
+		)`,
+		`CREATE TABLE IF NOT EXISTS replay_nonce_counters (
+			scope TEXT PRIMARY KEY,
+			next_value BIGINT NOT NULL DEFAULT 1,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 	}
 	for _, statement := range statements {
@@ -383,6 +397,62 @@ func (p *Postgres) MarkPlanRefreshLimitEmailSent(ctx context.Context, day time.T
 		day.Format("2006-01-02"),
 	)
 	return err
+}
+
+func (p *Postgres) NextReplayNonce(ctx context.Context, scope string) (string, error) {
+	for {
+		candidate, err := p.nextReplayNonceCandidate(ctx, scope)
+		if err != nil {
+			return "", err
+		}
+		var exists bool
+		if err := p.db.QueryRowContext(ctx,
+			`SELECT EXISTS (
+				SELECT 1 FROM replay_nonces
+				WHERE scope = $1 AND replay_nonce = $2
+			)`,
+			scope, candidate,
+		).Scan(&exists); err != nil {
+			return "", err
+		}
+		if !exists {
+			return candidate, nil
+		}
+	}
+}
+
+func (p *Postgres) nextReplayNonceCandidate(ctx context.Context, scope string) (string, error) {
+	var candidate string
+	err := p.db.QueryRowContext(ctx,
+		`INSERT INTO replay_nonce_counters (scope, next_value)
+		 VALUES ($1, 2)
+		 ON CONFLICT (scope) DO UPDATE
+		 SET next_value = replay_nonce_counters.next_value + 1,
+		     updated_at = now()
+		 RETURNING (next_value - 1)::TEXT`,
+		scope,
+	).Scan(&candidate)
+	return candidate, err
+}
+
+func (p *Postgres) ConsumeReplayNonce(ctx context.Context, scope string, replayNonce string) error {
+	result, err := p.db.ExecContext(ctx,
+		`INSERT INTO replay_nonces (scope, replay_nonce)
+		 VALUES ($1, $2)
+		 ON CONFLICT (scope, replay_nonce) DO NOTHING`,
+		scope, replayNonce,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrReplayNonceConsumed
+	}
+	return nil
 }
 
 func (p *Postgres) ensureDailyResetLimitRow(ctx context.Context, day time.Time) error {
