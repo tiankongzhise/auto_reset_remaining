@@ -1,77 +1,118 @@
-# Non-secret runtime configuration for auto_reset_remaining.
-# Copy this file to config.toml and edit local values there.
+# auto_reset_remaining 的非密钥运行配置模板。
+# 复制为 config.toml 后修改；账号、密码、接口 key 等敏感项放在 .env 中。
 
 [rayplus]
+# RayPlus Web/API 基础地址；通常保持默认。
 base_url = "https://rayplus.site"
+# 调用 RayPlus/Codex 接口时发送的 User-Agent，便于服务端识别请求来源。
 user_agent = "auto-reset-remaining/1.0"
+# 余额字段的自定义 JSON 路径；留空时使用程序内置解析逻辑。
 balance_json_path = ""
 
 [codex]
+# Codex 订阅接口基础地址；通常保持默认。
 base_url = "https://codex.rayplus.site"
+# 指定要重置的订阅 ID；0 表示让程序自动选择可重置的活跃订阅。
 subscription_id = 0
 
 [smtp]
+# SMTP 服务器地址，例如 smtp.gmail.com、smtp.qq.com。
 host = "smtp.example.com"
+# SMTP 端口；587 通常使用 STARTTLS，465 通常使用 TLS。
 port = 587
+# 发件人邮箱地址，应与 .env 中的 SMTP_USER 或服务商允许的发件身份一致。
 from = "you@example.com"
+# 收件人列表；可配置多个邮箱，例如 ["a@example.com", "b@example.com"]。
 to = ["receiver@example.com"]
 
 [postgres]
+# PostgreSQL SSL 模式；本地通常为 disable，云数据库可能需要 require。
 sslmode = "disable"
 
 [http]
+# 用户点击邮件中的 /confirm-reset 链接时访问的公网基础地址，不要带末尾斜杠。
 public_base_url = "https://your-public-service.example.com"
+# HTTP 服务监听地址；127.0.0.1:8080 仅本机可访问，:8080 表示监听所有网卡。
 addr = "127.0.0.1:8080"
 
 [logs]
+# 余额查询日志目录；程序会把轮询结果写入该目录。
 query_log_dir = "logs"
 
 [logs.rotation]
+# 是否启用日志轮转接口和每日归档任务。
 enabled = false
+# 日志归档目录；启用日志轮转时必须与 query_log_dir 不同。
 archive_dir = "log_archives"
 
 [reset]
+# 低余额阈值；未启用自动重置时，余额低于该值会发送确认邮件。
 low_balance_threshold = 0.5
+# 是否启用自动重置；程序在人工确认成功累计达到阈值后也会自动更新该值。
 auto_reset_enabled = false
+# 人工确认重置成功次数；达到 3 次后程序会开启 auto_reset_enabled。
 manual_confirm_success_count = 0
+# 每日最大成功重置次数；0 表示不限制。
 daily_max_reset_count = 0
+# 确认链接最长有效期，使用 Go duration 格式，如 30m、2h、24h；实际过期时间不会晚于本地 0 点。
 confirm_token_ttl = "24h"
+# 自动重置冷却时间，防止余额持续为 0 时频繁重复重置。
 cooldown = "1m"
+# 自动重置模式下强制改为人工确认的本地时间段；空字符串表示不启用，格式示例 "22:00-09:00"。
 manual_confirm_time_range = ""
 
 [polling]
+# 默认余额查询间隔，使用 Go duration 格式，如 1s、30s、1m。
 default_interval = "1s"
+# 判断余额是否发生变化的最小差值，用于避免浮点微小误差触发策略切换。
 balance_change_epsilon = 0.000001
 
 [polling.subscription]
+# 是否按订阅总额度比例动态调整查询间隔。
 enabled = false
+# 订阅总额度；启用 subscription 策略时必须大于 0。
 quota = 0
 
 [[polling.subscription.tiers]]
+# 当 当前余额 / quota >= min_ratio 时使用本 tier 的 interval；tiers 会按 min_ratio 从高到低匹配。
 min_ratio = 0.70
+# 当前 tier 的查询间隔。
 interval = "1m"
 
 [[polling.subscription.tiers]]
+# 余额比例大于等于 40% 时的查询间隔。
 min_ratio = 0.40
+# 当前 tier 的查询间隔。
 interval = "30s"
 
 [[polling.subscription.tiers]]
+# 余额比例大于等于 20% 时的查询间隔。
 min_ratio = 0.20
+# 当前 tier 的查询间隔。
 interval = "10s"
 
 [[polling.subscription.tiers]]
+# 余额比例接近耗尽但仍大于 0 时的查询间隔。
 min_ratio = 0.000001
+# 当前 tier 的查询间隔。
 interval = "3s"
 
 [[polling.subscription.tiers]]
+# 余额为 0 或低于所有其他 tier 时的兜底查询间隔。
 min_ratio = 0
+# 当前 tier 的查询间隔。
 interval = "1s"
 
 [polling.sleep]
+# 是否启用休眠策略：余额长时间不变时降低查询频率。
 enabled = false
+# 余额持续不变多久后进入休眠查询策略。
 unchanged_for = "10m"
+# 进入休眠策略后的查询间隔。
 interval = "1m"
 
 [polling.after_reset_email]
+# 发送重置确认邮件后，是否临时使用固定间隔查询，直到余额发生变化。
 enabled = false
+# 发送确认邮件后的临时查询间隔。
 interval = "1m"
