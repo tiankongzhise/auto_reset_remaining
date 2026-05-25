@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local uv/cache state
+.uv-cache/
+.uv-python/
+
+# Local runtime files
+config.toml
+data/
+logs/
+log_archives/
+
+# Local editor/system files
+.idea/
+.vscode/
+*.log

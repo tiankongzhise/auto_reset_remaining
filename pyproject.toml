@@ -1,0 +1,17 @@
+[project]
+name = "auto-reset-remaining"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "3700x", email = "tiankongzhise@163.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+auto-reset-remaining = "auto_reset_remaining:main"
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
