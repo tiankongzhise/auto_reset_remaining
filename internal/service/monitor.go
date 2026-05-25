@@ -125,6 +125,15 @@ func NewMonitor(cfg config.Config, envPath string, apiClient APIClient, sender m
 }
 
 func (m *Monitor) Initialize(ctx context.Context) error {
+	invalidated, err := m.store.InvalidateActiveConfirmTokensOnStartup(ctx)
+	if err != nil {
+		return err
+	}
+	if len(invalidated) > 0 {
+		if err := m.sendStartupInvalidatedConfirmTokensEmail(ctx, invalidated); err != nil {
+			m.logger.Printf("startup confirm token invalidation notification failed invalidated=%d error=%v", len(invalidated), err)
+		}
+	}
 	pending, err := m.store.HasActiveConfirmToken(ctx)
 	if err != nil {
 		return err
@@ -443,6 +452,21 @@ func (m *Monitor) CancelResetEmails(ctx context.Context, key string) (CancelRese
 	m.mu.Unlock()
 	m.logger.Printf("cancel reset emails succeeded cancelled=%d", cancelled)
 	return CancelResetEmailResult{Cancelled: cancelled, Status: "reset_emails_cancelled"}, nil
+}
+
+func (m *Monitor) sendStartupInvalidatedConfirmTokensEmail(ctx context.Context, tokens []store.InvalidatedConfirmToken) error {
+	subject := "重置链接已因服务重启失效"
+	var body strings.Builder
+	body.WriteString("服务启动自检发现存在已发送但尚未点击确认的重置链接。\n\n")
+	body.WriteString("为防止旧链接卡住后续正常流程，以下重置链接已经标记为服务重启自检失效。请忽略这些旧邮件，等待服务重新发送新的重置确认邮件，或按需手动处理。\n")
+	for i, token := range tokens {
+		body.WriteString(fmt.Sprintf("\n%d. 旧链接：/confirm-reset?token=<token_hash_prefix:%s>\n", i+1, tokenHashPrefix(token.TokenHash)))
+		body.WriteString(fmt.Sprintf("   余额：%.6f\n", token.Balance))
+		body.WriteString(fmt.Sprintf("   发送时间：%s\n", formatEmailTime(token.EmailSentAt)))
+		body.WriteString(fmt.Sprintf("   原过期时间：%s\n", formatEmailTime(token.ExpiresAt)))
+		body.WriteString(fmt.Sprintf("   失效时间：%s\n", formatEmailTime(token.InvalidatedAt)))
+	}
+	return m.mailer.Send(ctx, subject, body.String())
 }
 
 func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg config.Config, statusPrefix string) (ResendConfirmEmailResult, error) {
@@ -1099,6 +1123,13 @@ func tokenHashPrefix(tokenHash string) string {
 		return tokenHash
 	}
 	return tokenHash[:12]
+}
+
+func formatEmailTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05 MST")
 }
 
 func confirmURL(baseURL, rawToken string) string {
