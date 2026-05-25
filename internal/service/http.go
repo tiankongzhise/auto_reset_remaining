@@ -6,16 +6,64 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
+	"auto_reset_remaining/internal/config"
 	"auto_reset_remaining/internal/store"
 )
+
+var (
+	ErrReplayNonceEndpointInvalid = errors.New("unsupported replay nonce endpoint")
+	ErrReplayNonceStoreMissing    = errors.New("replay nonce store is not configured")
+)
+
+type ReplayNonceResult struct {
+	Endpoint    string `json:"endpoint"`
+	ReplayNonce string `json:"replay_nonce"`
+	Status      string `json:"status"`
+}
 
 func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/generate-replay-nonce", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		endpoint, err := replayEndpointFor(r.URL.Query().Get("endpoint"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := endpoint.validateKey(monitor, rotator, r.URL.Query().Get("key")); err != nil {
+			http.Error(w, err.Error(), replayKeyHTTPStatus(err))
+			return
+		}
+		replayStore := replayNonceStore(monitor)
+		if replayStore == nil {
+			http.Error(w, ErrReplayNonceStoreMissing.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		replayNonce, err := replayStore.NextReplayNonce(ctx, endpoint.path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(ReplayNonceResult{
+			Endpoint:    endpoint.path,
+			ReplayNonce: replayNonce,
+			Status:      "replay_nonce_generated",
+		})
 	})
 	mux.HandleFunc("/confirm-reset", func(w http.ResponseWriter, r *http.Request) {
 		if monitor == nil {
@@ -181,4 +229,115 @@ func manualResetHTTPStatus(err error) int {
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+type replayEndpoint struct {
+	path        string
+	validateKey func(monitor *Monitor, rotator *LogRotator, key string) error
+}
+
+func replayEndpointFor(endpoint string) (replayEndpoint, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	switch endpoint {
+	case "/resend-reset-email":
+		return replayEndpoint{path: endpoint, validateKey: validateResendResetEmailKey}, nil
+	case "/manual-reset-subscription":
+		return replayEndpoint{path: endpoint, validateKey: validateManualResetKey}, nil
+	case "/test-reset-email":
+		return replayEndpoint{path: endpoint, validateKey: validateTestResetEmailKey}, nil
+	case "/cancel-reset-emails":
+		return replayEndpoint{path: endpoint, validateKey: validateCancelResetEmailKey}, nil
+	case "/rotate-logs":
+		return replayEndpoint{path: endpoint, validateKey: validateLogRotationKey}, nil
+	default:
+		return replayEndpoint{}, ErrReplayNonceEndpointInvalid
+	}
+}
+
+func validateResendResetEmailKey(monitor *Monitor, _ *LogRotator, key string) error {
+	cfg, err := replayMonitorConfig(monitor, "/resend-reset-email")
+	if err != nil {
+		return err
+	}
+	return requireSharedKey(cfg.ResendResetEmailKey, key, ErrResendKeyMissing, ErrResendUnauthorized)
+}
+
+func validateManualResetKey(monitor *Monitor, _ *LogRotator, key string) error {
+	cfg, err := replayMonitorConfig(monitor, "/manual-reset-subscription")
+	if err != nil {
+		return err
+	}
+	return requireSharedKey(cfg.ExternalManualResetKey, key, ErrExternalManualResetKeyMissing, ErrExternalManualResetUnauthorized)
+}
+
+func validateTestResetEmailKey(monitor *Monitor, _ *LogRotator, key string) error {
+	cfg, err := replayMonitorConfig(monitor, "/test-reset-email")
+	if err != nil {
+		return err
+	}
+	return requireSharedKey(cfg.TestResetEmailKey, key, ErrTestResetEmailKeyMissing, ErrTestResetEmailUnauthorized)
+}
+
+func validateCancelResetEmailKey(monitor *Monitor, _ *LogRotator, key string) error {
+	cfg, err := replayMonitorConfig(monitor, "/cancel-reset-emails")
+	if err != nil {
+		return err
+	}
+	return requireSharedKey(cfg.CancelResetEmailKey, key, ErrCancelResetEmailKeyMissing, ErrCancelResetEmailUnauthorized)
+}
+
+func validateLogRotationKey(_ *Monitor, rotator *LogRotator, key string) error {
+	if rotator == nil {
+		return ErrLogRotationDisabled
+	}
+	if !rotator.validKey(key) {
+		return ErrLogRotationUnauthorized
+	}
+	return nil
+}
+
+func replayMonitorConfig(monitor *Monitor, endpoint string) (config.Config, error) {
+	if monitor == nil {
+		return config.Config{}, ErrReplayNonceStoreMissing
+	}
+	cfg, refreshErr := monitor.refreshEmailConfig()
+	if refreshErr != nil {
+		monitor.logger.Printf("replay nonce config refresh failed endpoint=%s error=%v", endpoint, refreshErr)
+		cfg = monitor.snapshot()
+	}
+	return cfg, nil
+}
+
+func replayNonceStore(monitor *Monitor) store.Store {
+	if monitor == nil {
+		return nil
+	}
+	return monitor.store
+}
+
+func replayKeyHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrResendUnauthorized), errors.Is(err, ErrResendKeyMissing),
+		errors.Is(err, ErrExternalManualResetUnauthorized), errors.Is(err, ErrExternalManualResetKeyMissing),
+		errors.Is(err, ErrTestResetEmailUnauthorized), errors.Is(err, ErrTestResetEmailKeyMissing),
+		errors.Is(err, ErrCancelResetEmailUnauthorized), errors.Is(err, ErrCancelResetEmailKeyMissing),
+		errors.Is(err, ErrLogRotationUnauthorized):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrReplayNonceStoreMissing), errors.Is(err, ErrLogRotationDisabled):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func normalizeReplayNonce(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("replay_nonce is required")
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return "", errors.New("replay_nonce must be a positive integer")
+	}
+	return strconv.FormatInt(value, 10), nil
 }

@@ -171,3 +171,70 @@ func TestCancelResetEmailsHTTPHandler(t *testing.T) {
 		t.Fatalf("result = %+v, want one cancelled", result)
 	}
 }
+
+func TestGenerateReplayNonceHTTPHandler(t *testing.T) {
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{
+		ResendResetEmailKey: "resend-secret",
+		TestResetEmailKey:   "test-secret",
+	})
+	handler := NewHTTPHandler(monitor, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/generate-replay-nonce?endpoint=/unknown&key=resend-secret", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unknown endpoint status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/generate-replay-nonce?endpoint=/resend-reset-email&key=wrong", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong key status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/generate-replay-nonce?endpoint=/resend-reset-email&key=resend-secret", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("generate status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var first ReplayNonceResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if first.Endpoint != "/resend-reset-email" || first.ReplayNonce != "1" || first.Status != "replay_nonce_generated" {
+		t.Fatalf("first result = %+v, want resend endpoint nonce 1", first)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/generate-replay-nonce?endpoint=/resend-reset-email&key=resend-secret", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("second generate status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var second ReplayNonceResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if second.ReplayNonce != "2" {
+		t.Fatalf("second nonce = %q, want 2", second.ReplayNonce)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/generate-replay-nonce?endpoint=/test-reset-email&key=test-secret", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("other endpoint generate status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var other ReplayNonceResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &other); err != nil {
+		t.Fatalf("decode other response: %v", err)
+	}
+	if other.Endpoint != "/test-reset-email" || other.ReplayNonce != "1" {
+		t.Fatalf("other result = %+v, want test endpoint nonce 1", other)
+	}
+}
