@@ -108,12 +108,26 @@ GET /healthz
 GET /confirm-reset?token=<token>
 ```
 
+防重放参数生成接口会校验目标接口对应的 key，并按目标接口生成递增的 `replay_nonce`：
+
+```text
+GET /generate-replay-nonce?endpoint=/resend-reset-email&key=<RESEND_RESET_EMAIL_KEY>
+```
+
+返回示例：
+
+```json
+{"endpoint":"/resend-reset-email","replay_nonce":"1","status":"replay_nonce_generated"}
+```
+
+生成接口只生成参数，不会预占用这个参数。真正的防重放记录会在目标接口处理请求前写入数据库；同一个 endpoint 下重复使用相同 `replay_nonce` 会返回 409，并提示防重放参数已经被处理过。不同 endpoint 可以使用相同的 `replay_nonce`。`/confirm-reset?token=...` 不需要 `replay_nonce`，因为它不是直接通过 key 访问的接口。
+
 确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在本地 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`。
 
 如果自动发送确认邮件失败，或需要让旧确认链接作废并重新发送一封确认邮件，可以调用补发接口：
 
 ```text
-GET /resend-reset-email?key=<RESEND_RESET_EMAIL_KEY>
+GET /resend-reset-email?key=<RESEND_RESET_EMAIL_KEY>&replay_nonce=<REPLAY_NONCE>
 ```
 
 `RESEND_RESET_EMAIL_KEY` 来自 `.env`。key 验证成功后，服务会重新查询当前余额、发送一封新的重置确认邮件，并使之前未使用的确认链接失效。
@@ -121,7 +135,7 @@ GET /resend-reset-email?key=<RESEND_RESET_EMAIL_KEY>
 外部手动重置接口默认关闭，需同时满足 `.env` 中 `EXTERNAL_MANUAL_RESET_ENABLED=true` 且 key 正确：
 
 ```text
-GET /manual-reset-subscription?key=<EXTERNAL_MANUAL_RESET_KEY>
+GET /manual-reset-subscription?key=<EXTERNAL_MANUAL_RESET_KEY>&replay_nonce=<REPLAY_NONCE>
 ```
 
 执行成功后会查询当前余额、调用订阅重置接口，并发送一封邮件提示当前余额和“用户通过手动方式重置了订阅额度”。
@@ -129,13 +143,13 @@ GET /manual-reset-subscription?key=<EXTERNAL_MANUAL_RESET_KEY>
 测试重置邮件接口不会真的重置订阅，但会校验 key、查询余额、写入 dry-run 日志并发送测试邮件：
 
 ```text
-GET /test-reset-email?key=<TEST_RESET_EMAIL_KEY>
+GET /test-reset-email?key=<TEST_RESET_EMAIL_KEY>&replay_nonce=<REPLAY_NONCE>
 ```
 
 撤销未验证的重置邮件：
 
 ```text
-GET /cancel-reset-emails?key=<CANCEL_RESET_EMAIL_KEY>
+GET /cancel-reset-emails?key=<CANCEL_RESET_EMAIL_KEY>&replay_nonce=<REPLAY_NONCE>
 ```
 
 撤销后，数据库中的确认邮件记录会标记为 `manual_cancelled`；它不会再被视为待验证邮件，也不会阻塞后续正常发送新的确认邮件。
@@ -213,7 +227,7 @@ archive_dir = "log_archives"
 手动轮转接口：
 
 ```text
-GET /rotate-logs?key=<LOG_ROTATION_KEY>
+GET /rotate-logs?key=<LOG_ROTATION_KEY>&replay_nonce=<REPLAY_NONCE>
 ```
 
 `LOG_ROTATION_KEY` 来自 `.env`。`archive_dir` 不能和 `query_log_dir` 指向同一目录。

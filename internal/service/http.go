@@ -55,6 +55,7 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
 
+		// Generation only advances the per-endpoint counter; replay protection is enforced when the target endpoint consumes the nonce.
 		replayNonce, err := replayStore.NextReplayNonce(ctx, endpoint.path)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
