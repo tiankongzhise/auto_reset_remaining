@@ -34,6 +34,7 @@ class FieldSpec:
     path: FieldPath
     label: str
     secret: bool = False
+    group: str = "基础配置"
 
 
 FIELD_SPECS = [
@@ -53,15 +54,15 @@ FIELD_SPECS = [
     FieldSpec(("reset", "confirm_request_ttl"), "确认有效期"),
     FieldSpec(("reset", "cooldown"), "自动重置冷却"),
     FieldSpec(("reset", "manual_confirm_time_range"), "强制人工确认时间段"),
-    FieldSpec(("polling", "default_interval"), "查询间隔"),
-    FieldSpec(("polling", "balance_change_epsilon"), "余额变化容差"),
-    FieldSpec(("polling", "subscription", "enabled"), "动态分档查询"),
-    FieldSpec(("polling", "subscription", "quota"), "订阅总额度"),
-    FieldSpec(("polling", "sleep", "enabled"), "余额不变降频"),
-    FieldSpec(("polling", "sleep", "unchanged_for"), "余额不变时长"),
-    FieldSpec(("polling", "sleep", "interval"), "余额不变查询间隔"),
-    FieldSpec(("polling", "after_reset_email", "enabled"), "确认请求后固定轮询"),
-    FieldSpec(("polling", "after_reset_email", "interval"), "确认请求后查询间隔"),
+    FieldSpec(("polling", "default_interval"), "查询间隔", group="轮询策略"),
+    FieldSpec(("polling", "balance_change_epsilon"), "余额变化容差", group="轮询策略"),
+    FieldSpec(("polling", "subscription", "enabled"), "动态分档查询", group="轮询策略"),
+    FieldSpec(("polling", "subscription", "quota"), "订阅总额度", group="轮询策略"),
+    FieldSpec(("polling", "sleep", "enabled"), "余额不变降频", group="轮询策略"),
+    FieldSpec(("polling", "sleep", "unchanged_for"), "余额不变时长", group="轮询策略"),
+    FieldSpec(("polling", "sleep", "interval"), "余额不变查询间隔", group="轮询策略"),
+    FieldSpec(("polling", "after_reset_email", "enabled"), "确认请求后固定轮询", group="轮询策略"),
+    FieldSpec(("polling", "after_reset_email", "interval"), "确认请求后查询间隔", group="轮询策略"),
     FieldSpec(("logs", "query_log_dir"), "查询日志目录"),
 ]
 
@@ -72,57 +73,83 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
 
     root = tk.Tk()
     root.title("auto_reset_remaining 配置确认")
-    root.geometry("720x680")
-    root.minsize(640, 560)
+    root.geometry("820x720")
+    root.minsize(720, 600)
+    root.columnconfigure(0, weight=1)
+
+    style = ttk.Style(root)
+    style.configure("Config.TLabelframe", padding=12)
+    style.configure("Config.TLabelframe.Label", font=("", 10, "bold"))
 
     result: dict[str, AppConfig] = {}
     variables: dict[FieldPath, tk.StringVar] = {}
     tier_variables: list[tuple[tk.StringVar, tk.StringVar]] = []
 
     intro = "首次启动已从默认模板生成 config.toml，请确认配置后再进入主界面。" if created else "请确认 config.toml 的本地运行配置。"
-    ttk.Label(root, text=intro, anchor="w").pack(fill="x", padx=16, pady=(16, 8))
+    ttk.Label(root, text=intro, anchor="w").pack(fill="x", padx=20, pady=(18, 10))
 
     frame = ttk.Frame(root)
-    frame.pack(fill="both", expand=True, padx=16, pady=8)
+    frame.pack(fill="both", expand=True, padx=20, pady=8)
 
-    canvas = tk.Canvas(frame, highlightthickness=0)
+    canvas = tk.Canvas(frame, highlightthickness=0, borderwidth=0)
     scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
     form = ttk.Frame(canvas)
     form.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.create_window((0, 0), window=form, anchor="nw")
+    canvas_window = canvas.create_window((0, 0), window=form, anchor="nw")
+    canvas.bind("<Configure>", lambda event: canvas.itemconfigure(canvas_window, width=event.width))
     canvas.configure(yscrollcommand=scrollbar.set)
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
 
-    for row, spec in enumerate(FIELD_SPECS):
+    row = 0
+    current_group = ""
+    current_group_frame: ttk.LabelFrame | None = None
+    group_row = 0
+    for spec in FIELD_SPECS:
+        if spec.group != current_group:
+            current_group = spec.group
+            current_group_frame = ttk.LabelFrame(form, text=current_group, style="Config.TLabelframe")
+            current_group_frame.grid(row=row, column=0, sticky="ew", pady=(0 if row == 0 else 12, 0))
+            current_group_frame.columnconfigure(1, weight=1, minsize=360)
+            row += 1
+            group_row = 0
         value = _document_value(document, spec.path)
         variable = tk.StringVar(value=value)
         variables[spec.path] = variable
-        ttk.Label(form, text=spec.label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
-        entry = ttk.Entry(form, textvariable=variable, show="*" if spec.secret else "")
-        entry.grid(row=row, column=1, sticky="ew", pady=5)
+        assert current_group_frame is not None
+        ttk.Label(current_group_frame, text=spec.label, width=22, anchor="w").grid(
+            row=group_row,
+            column=0,
+            sticky="w",
+            padx=(0, 14),
+            pady=5,
+        )
+        entry = ttk.Entry(current_group_frame, textvariable=variable, show="*" if spec.secret else "", width=46)
+        entry.grid(row=group_row, column=1, sticky="ew", pady=5)
+        group_row += 1
 
-    tier_start_row = len(FIELD_SPECS)
-    ttk.Label(form, text="订阅分档").grid(row=tier_start_row, column=0, sticky="nw", padx=(0, 12), pady=5)
-    tiers_frame = ttk.Frame(form)
-    tiers_frame.grid(row=tier_start_row, column=1, sticky="ew", pady=5)
+    tiers_group = ttk.LabelFrame(form, text="订阅分档", style="Config.TLabelframe")
+    tiers_group.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+    tiers_group.columnconfigure(0, weight=1)
+    tiers_frame = ttk.Frame(tiers_group)
+    tiers_frame.grid(row=0, column=0, sticky="ew")
     tiers_frame.columnconfigure(0, weight=1)
     tiers_frame.columnconfigure(1, weight=1)
 
     def render_tiers() -> None:
         for child in tiers_frame.winfo_children():
             child.destroy()
-        ttk.Label(tiers_frame, text="min_ratio").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(tiers_frame, text="interval").grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(tiers_frame, text="min_ratio").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 4))
+        ttk.Label(tiers_frame, text="interval").grid(row=0, column=1, sticky="w", padx=(0, 10), pady=(0, 4))
         for index, (min_ratio_var, interval_var) in enumerate(tier_variables, start=1):
-            ttk.Entry(tiers_frame, textvariable=min_ratio_var).grid(row=index, column=0, sticky="ew", padx=(0, 8), pady=3)
-            ttk.Entry(tiers_frame, textvariable=interval_var).grid(row=index, column=1, sticky="ew", padx=(0, 8), pady=3)
+            ttk.Entry(tiers_frame, textvariable=min_ratio_var, width=18).grid(row=index, column=0, sticky="ew", padx=(0, 10), pady=4)
+            ttk.Entry(tiers_frame, textvariable=interval_var, width=18).grid(row=index, column=1, sticky="ew", padx=(0, 10), pady=4)
             ttk.Button(
                 tiers_frame,
                 text="删除",
                 command=lambda row_index=index - 1: delete_tier(row_index),
-            ).grid(row=index, column=2, sticky="ew", pady=3)
-        ttk.Button(tiers_frame, text="新增分档", command=add_tier).grid(row=len(tier_variables) + 1, column=0, sticky="w", pady=(6, 0))
+            ).grid(row=index, column=2, sticky="ew", pady=4)
+        ttk.Button(tiers_frame, text="新增分档", command=add_tier).grid(row=len(tier_variables) + 1, column=0, sticky="w", pady=(8, 0))
 
     def add_tier() -> None:
         tier_variables.append((tk.StringVar(value="0"), tk.StringVar(value="1m")))
@@ -135,10 +162,10 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
     for min_ratio, interval in _document_tier_values(document):
         tier_variables.append((tk.StringVar(value=min_ratio), tk.StringVar(value=interval)))
     render_tiers()
-    form.columnconfigure(1, weight=1)
+    form.columnconfigure(0, weight=1)
 
     buttons = ttk.Frame(root)
-    buttons.pack(fill="x", padx=16, pady=(8, 16))
+    buttons.pack(fill="x", padx=20, pady=(10, 18))
 
     def save_and_continue() -> None:
         try:
@@ -154,8 +181,8 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
     def cancel() -> None:
         root.destroy()
 
-    ttk.Button(buttons, text="确认并启动", command=save_and_continue).pack(side="right")
-    ttk.Button(buttons, text="退出", command=cancel).pack(side="right", padx=(0, 8))
+    ttk.Button(buttons, text="确认并启动", command=save_and_continue).pack(side="right", ipadx=8)
+    ttk.Button(buttons, text="退出", command=cancel).pack(side="right", padx=(0, 10), ipadx=8)
 
     root.protocol("WM_DELETE_WINDOW", cancel)
     root.mainloop()
