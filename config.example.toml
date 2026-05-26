@@ -55,11 +55,53 @@ manual_confirm_time_range = ""
 
 
 [polling]
-# 默认余额查询间隔；支持 ms、s、m、h，例如 10s、1m。
+# 默认余额查询间隔；没有余额样本或动态分档未匹配时使用。
 default_interval = "10s"
 
 # 判断余额是否发生真实变化的最小差值，用于过滤浮点误差。
 balance_change_epsilon = 0.000001
+
+[polling.subscription]
+# 是否按 当前余额 / quota 动态调整查询间隔，避免余额充足时过度查询接口。
+enabled = true
+# 订阅总额度；RayPlus Codex 常见日额度为 100，请按自己的套餐调整。
+quota = 100
+
+[[polling.subscription.tiers]]
+# 余额比例大于等于 70% 时，每 1 分钟查询一次。
+min_ratio = 0.70
+interval = "1m"
+
+[[polling.subscription.tiers]]
+# 余额比例大于等于 40% 时，每 30 秒查询一次。
+min_ratio = 0.40
+interval = "30s"
+
+[[polling.subscription.tiers]]
+# 余额比例大于等于 20% 时，每 10 秒查询一次。
+min_ratio = 0.20
+interval = "10s"
+
+[[polling.subscription.tiers]]
+# 余额接近耗尽但仍大于 0 时，每 3 秒查询一次。
+min_ratio = 0.000001
+interval = "3s"
+
+[[polling.subscription.tiers]]
+# 余额为 0 或低于所有其他档位时，每 1 秒查询一次。
+min_ratio = 0
+interval = "1s"
+
+[polling.sleep]
+# 余额长时间不变时降低查询频率。
+enabled = false
+unchanged_for = "10m"
+interval = "1m"
+
+[polling.after_reset_email]
+# 创建低余额确认请求后，是否临时使用固定间隔查询，直到余额发生变化。
+enabled = false
+interval = "1m"
 
 
 [logs]

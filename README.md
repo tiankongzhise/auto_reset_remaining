@@ -91,7 +91,7 @@ uv run auto-reset-remaining
 
 按钮说明：
 
-- “启动监控”：按 `polling.default_interval` 定时查询余额。
+- “启动监控”：按 `polling.subscription` 的余额分档动态查询余额，未匹配时使用 `polling.default_interval`。
 - “暂停监控”：暂停后台轮询。
 - “立即查询”：马上执行一次余额查询和判断。
 - “手动重置”：主动查询余额并执行一次重置。
@@ -239,7 +239,7 @@ manual_confirm_time_range = "22:00-09:00"
 
 `polling.default_interval`
 
-余额查询间隔。支持 `ms`、`s`、`m`、`h`。
+默认余额查询间隔。支持 `ms`、`s`、`m`、`h`。没有余额样本，或未启用动态分档时，会使用它作为兜底间隔。
 
 推荐先使用：
 
@@ -247,7 +247,7 @@ manual_confirm_time_range = "22:00-09:00"
 default_interval = "10s"
 ```
 
-如果不需要频繁查询，可以改为 `30s` 或 `1m`。
+默认配置会按余额比例动态查询，避免余额充足时一直每 10 秒调用余额接口。
 
 `polling.balance_change_epsilon`
 
@@ -256,6 +256,38 @@ default_interval = "10s"
 ```toml
 balance_change_epsilon = 0.000001
 ```
+
+`polling.subscription`
+
+按 `当前余额 / quota` 匹配查询间隔，tiers 会按 `min_ratio` 从高到低匹配。默认分档与原服务一致：
+
+```toml
+[polling.subscription]
+enabled = true
+quota = 100
+
+[[polling.subscription.tiers]]
+min_ratio = 0.70
+interval = "1m"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.40
+interval = "30s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.20
+interval = "10s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.000001
+interval = "3s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0
+interval = "1s"
+```
+
+`polling.sleep` 可选：余额长时间不变后降低查询频率。`polling.after_reset_email` 可选：创建低余额确认请求后临时固定间隔查询，直到余额发生变化。
 
 ### logs
 
@@ -290,6 +322,10 @@ manual_confirm_time_range = ""
 [polling]
 default_interval = "10s"
 balance_change_epsilon = 0.000001
+
+[polling.subscription]
+enabled = true
+quota = 100
 ```
 
 这样程序会先走人工确认流程，不会一上来自动重置。确认流程稳定后，累计 3 次人工确认成功会自动开启自动重置。

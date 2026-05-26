@@ -45,6 +45,57 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.codex.subscription_id, 0)
         self.assertEqual(config.sqlite.path, Path("data/test.sqlite3"))
         self.assertEqual(config.polling.default_interval_seconds, 10)
+        self.assertTrue(config.polling.subscription.enabled)
+        self.assertEqual(config.polling.subscription.quota, 100)
+        self.assertEqual(config.polling.subscription.tiers[0].interval_seconds, 60)
+
+    def test_load_custom_polling_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                _valid_config_text()
+                + """
+[polling.sleep]
+enabled = true
+unchanged_for = "5m"
+interval = "2m"
+
+[polling.after_reset_email]
+enabled = true
+interval = "15s"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+        self.assertTrue(config.polling.sleep.enabled)
+        self.assertEqual(config.polling.sleep.unchanged_for_seconds, 300)
+        self.assertEqual(config.polling.sleep.interval_seconds, 120)
+        self.assertTrue(config.polling.after_reset_email.enabled)
+        self.assertEqual(config.polling.after_reset_email.interval_seconds, 15)
+
+    def test_subscription_section_can_reuse_default_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                _valid_config_text_without_subscription_tiers()
+                + """
+[polling.subscription]
+enabled = true
+quota = 200
+
+[logs]
+query_log_dir = "logs"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+        self.assertTrue(config.polling.subscription.enabled)
+        self.assertEqual(config.polling.subscription.quota, 200)
+        self.assertEqual(config.polling.subscription.tiers[0].interval_seconds, 60)
 
     def test_placeholder_config_is_rejected(self) -> None:
         with self.assertRaises(ConfigError):
@@ -63,6 +114,37 @@ class ConfigTests(unittest.TestCase):
 
 
 def _valid_config_text() -> str:
+    return _valid_config_text_without_subscription_tiers() + """
+[polling.subscription]
+enabled = true
+quota = 100
+
+[[polling.subscription.tiers]]
+min_ratio = 0.70
+interval = "1m"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.40
+interval = "30s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.20
+interval = "10s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0.000001
+interval = "3s"
+
+[[polling.subscription.tiers]]
+min_ratio = 0
+interval = "1s"
+
+[logs]
+query_log_dir = "logs"
+"""
+
+
+def _valid_config_text_without_subscription_tiers() -> str:
     return """
 [rayplus]
 base_url = "https://rayplus.site"
@@ -91,9 +173,6 @@ manual_confirm_time_range = "22:00-09:00"
 [polling]
 default_interval = "10s"
 balance_change_epsilon = 0.000001
-
-[logs]
-query_log_dir = "logs"
 """
 
 

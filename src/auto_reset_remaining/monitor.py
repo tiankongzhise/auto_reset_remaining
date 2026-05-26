@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
+import math
 import secrets
 import threading
 import time
 from typing import Callable, Protocol
 
 from auto_reset_remaining.api import APIClient, APIError, APINetworkError, BalanceResult, ResetResult
-from auto_reset_remaining.config import AppConfig, is_time_in_manual_confirm_range, update_runtime_state
+from auto_reset_remaining.config import AppConfig, PollingConfig, is_time_in_manual_confirm_range, update_runtime_state
 from auto_reset_remaining.query_log import QueryLogEntry, QueryLogger
 from auto_reset_remaining.store import SQLiteStore
 
@@ -59,6 +60,21 @@ class ExecutedReset:
     log_id: int
 
 
+@dataclass(frozen=True)
+class PollingState:
+    has_last_balance: bool
+    last_balance: float
+    last_balance_changed_at: datetime | None
+    force_fast_until_balance_change: bool
+
+
+@dataclass(frozen=True)
+class PollingPolicy:
+    name: str
+    interval_seconds: float
+    reason: str
+
+
 class Monitor:
     def __init__(
         self,
@@ -82,6 +98,9 @@ class Monitor:
         self._lock = threading.Lock()
         self._reset_lock = threading.Lock()
         self._last_balance: float | None = None
+        self._last_balance_changed_at: datetime | None = None
+        self._force_fast_until_balance_change = False
+        self._force_fast_reference_balance: float | None = None
         self._last_error: str | None = None
         self._status = "未启动"
         self._last_auto_reset_at: datetime | None = None
@@ -176,8 +195,11 @@ class Monitor:
     def _run_loop(self) -> None:
         while not self._stop.is_set():
             self.tick_once()
-            interval = max(self.config.polling.default_interval_seconds, 0.1)
-            self.sleeper(interval)
+            interval = max(self.next_poll_interval(), 0.1)
+            if self.sleeper is time.sleep:
+                self._stop.wait(interval)
+            else:
+                self.sleeper(interval)
 
     def _tick(self) -> tuple[str, float | None]:
         today = date.today()
@@ -192,12 +214,11 @@ class Monitor:
         except APINetworkError as exc:
             raise BalanceQueryNetworkError(str(exc)) from exc
         balance = balance_result.balance
-        with self._lock:
-            self._last_balance = balance
-            self._last_error = None
+        self._observe_balance(datetime.now(), balance)
 
         status = self._handle_balance(balance, balance_result)
         with self._lock:
+            self._last_error = None
             self._status = status
         self._emit("status", f"余额：{balance:.6f}，状态：{status}", balance=balance, status=status)
         return status, balance
@@ -246,6 +267,7 @@ class Monitor:
         token_hash = hash_token(raw_token)
         expires_at = datetime.now() + timedelta(seconds=self.config.reset.confirm_request_ttl_seconds)
         self.store.create_confirm_request(token_hash, balance, expires_at)
+        self._start_after_reset_email_polling(balance)
         if self.confirm_callback is None:
             self._emit("warning", "已创建低余额确认请求，等待用户在弹窗中确认", balance=balance, status="confirm_pending")
             return f"{reason}_confirm_pending"
@@ -325,6 +347,46 @@ class Monitor:
             self._status = status
         self._emit("status", message, status=status)
 
+    def next_poll_interval(self, now: datetime | None = None) -> float:
+        return self.next_poll_policy(now).interval_seconds
+
+    def next_poll_policy(self, now: datetime | None = None) -> PollingPolicy:
+        now = now or datetime.now()
+        with self._lock:
+            state = PollingState(
+                has_last_balance=self._last_balance is not None,
+                last_balance=self._last_balance or 0,
+                last_balance_changed_at=self._last_balance_changed_at,
+                force_fast_until_balance_change=self._force_fast_until_balance_change,
+            )
+        return select_poll_policy(self.config.polling, state, now)
+
+    def _observe_balance(self, now: datetime, balance: float) -> None:
+        epsilon = self.config.polling.balance_change_epsilon
+        with self._lock:
+            if self._last_balance is None:
+                self._last_balance = balance
+                self._last_balance_changed_at = now
+                return
+            if not balance_changed(self._last_balance, balance, epsilon):
+                return
+            self._last_balance = balance
+            self._last_balance_changed_at = now
+            if (
+                self._force_fast_until_balance_change
+                and self._force_fast_reference_balance is not None
+                and balance_changed(self._force_fast_reference_balance, balance, epsilon)
+            ):
+                self._force_fast_until_balance_change = False
+                self._force_fast_reference_balance = None
+
+    def _start_after_reset_email_polling(self, balance: float) -> None:
+        if not self.config.polling.after_reset_email.enabled:
+            return
+        with self._lock:
+            self._force_fast_until_balance_change = True
+            self._force_fast_reference_balance = balance
+
     def _replace_runtime_state(self, manual_count: int, auto_enabled: bool) -> AppConfig:
         reset = self.config.reset
         updated_reset = type(reset)(
@@ -353,3 +415,42 @@ class Monitor:
 
 def hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def select_poll_policy(config: PollingConfig, state: PollingState, now: datetime) -> PollingPolicy:
+    if config.after_reset_email.enabled and state.force_fast_until_balance_change:
+        interval = positive_interval(config.after_reset_email.interval_seconds, config.default_interval_seconds)
+        return PollingPolicy("after_reset_email", interval, "waiting for balance change after confirm prompt")
+
+    if (
+        config.sleep.enabled
+        and state.has_last_balance
+        and state.last_balance_changed_at is not None
+        and (now - state.last_balance_changed_at).total_seconds() >= config.sleep.unchanged_for_seconds
+    ):
+        interval = positive_interval(config.sleep.interval_seconds, config.default_interval_seconds)
+        return PollingPolicy("sleep", interval, "balance unchanged long enough")
+
+    subscription = config.subscription
+    if subscription.enabled and subscription.quota > 0 and state.has_last_balance:
+        ratio = max(0.0, min(1.0, state.last_balance / subscription.quota))
+        for tier in subscription.tiers:
+            if ratio >= tier.min_ratio:
+                interval = positive_interval(tier.interval_seconds, config.default_interval_seconds)
+                return PollingPolicy("subscription", interval, f"balance ratio {ratio:.4f} matched tier {tier.min_ratio:.4f}")
+
+    interval = positive_interval(config.default_interval_seconds, 1.0)
+    reason = "fallback default interval" if state.has_last_balance else "no balance sample yet"
+    return PollingPolicy("default", interval, reason)
+
+
+def positive_interval(value: float, fallback: float) -> float:
+    if value > 0:
+        return value
+    if fallback > 0:
+        return fallback
+    return 1.0
+
+
+def balance_changed(left: float, right: float, epsilon: float) -> bool:
+    return math.fabs(left - right) > epsilon
