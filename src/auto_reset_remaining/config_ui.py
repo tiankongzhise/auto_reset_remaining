@@ -14,6 +14,7 @@ from auto_reset_remaining.config import (
     CONFIG_PATH,
     AppConfig,
     ConfigError,
+    DEFAULT_SUBSCRIPTION_TIERS,
     ensure_config_file,
     load_config,
     load_document,
@@ -35,6 +36,8 @@ class FieldSpec:
     label: str
     secret: bool = False
     group: str = "基础配置"
+    placeholder: str = ""
+    default: str = ""
 
 
 FIELD_SPECS = [
@@ -43,7 +46,7 @@ FIELD_SPECS = [
     FieldSpec(("rayplus", "email"), "RayPlus 登录邮箱"),
     FieldSpec(("rayplus", "password"), "RayPlus 登录密码", secret=True),
     FieldSpec(("rayplus", "user_agent"), "User-Agent"),
-    FieldSpec(("rayplus", "balance_json_path"), "余额 JSON 路径"),
+    FieldSpec(("rayplus", "balance_json_path"), "余额 JSON 路径", placeholder="可留空；例如 data.balance"),
     FieldSpec(("codex", "base_url"), "Codex 地址"),
     FieldSpec(("codex", "subscription_id"), "订阅 ID（0 为自动选择）"),
     FieldSpec(("sqlite", "path"), "SQLite 文件路径"),
@@ -51,18 +54,18 @@ FIELD_SPECS = [
     FieldSpec(("reset", "auto_reset_enabled"), "自动重置"),
     FieldSpec(("reset", "manual_confirm_success_count"), "人工确认成功次数"),
     FieldSpec(("reset", "daily_max_reset_count"), "每日最大重置次数（0 不限制）"),
-    FieldSpec(("reset", "confirm_request_ttl"), "确认有效期"),
-    FieldSpec(("reset", "cooldown"), "自动重置冷却"),
-    FieldSpec(("reset", "manual_confirm_time_range"), "强制人工确认时间段"),
-    FieldSpec(("polling", "default_interval"), "查询间隔", group="轮询策略"),
-    FieldSpec(("polling", "balance_change_epsilon"), "余额变化容差", group="轮询策略"),
-    FieldSpec(("polling", "subscription", "enabled"), "动态分档查询", group="轮询策略"),
-    FieldSpec(("polling", "subscription", "quota"), "订阅总额度", group="轮询策略"),
-    FieldSpec(("polling", "sleep", "enabled"), "余额不变降频", group="轮询策略"),
-    FieldSpec(("polling", "sleep", "unchanged_for"), "余额不变时长", group="轮询策略"),
-    FieldSpec(("polling", "sleep", "interval"), "余额不变查询间隔", group="轮询策略"),
-    FieldSpec(("polling", "after_reset_email", "enabled"), "确认请求后固定轮询", group="轮询策略"),
-    FieldSpec(("polling", "after_reset_email", "interval"), "确认请求后查询间隔", group="轮询策略"),
+    FieldSpec(("reset", "confirm_request_ttl"), "确认有效期", placeholder="例如 24h"),
+    FieldSpec(("reset", "cooldown"), "自动重置冷却", placeholder="例如 1m"),
+    FieldSpec(("reset", "manual_confirm_time_range"), "强制人工确认时间段", placeholder="可留空；例如 22:00-09:00"),
+    FieldSpec(("polling", "default_interval"), "查询间隔", group="轮询策略", placeholder="例如 10s", default="10s"),
+    FieldSpec(("polling", "balance_change_epsilon"), "余额变化容差", group="轮询策略", default="0.000001"),
+    FieldSpec(("polling", "subscription", "enabled"), "动态分档查询", group="轮询策略", default="true"),
+    FieldSpec(("polling", "subscription", "quota"), "订阅总额度", group="轮询策略", default="100"),
+    FieldSpec(("polling", "sleep", "enabled"), "余额不变降频", group="轮询策略", default="false"),
+    FieldSpec(("polling", "sleep", "unchanged_for"), "余额不变时长", group="轮询策略", placeholder="例如 10m", default="10m"),
+    FieldSpec(("polling", "sleep", "interval"), "余额不变查询间隔", group="轮询策略", placeholder="例如 5m", default="1m"),
+    FieldSpec(("polling", "after_reset_email", "enabled"), "确认请求后固定轮询", group="轮询策略", default="false"),
+    FieldSpec(("polling", "after_reset_email", "interval"), "确认请求后查询间隔", group="轮询策略", placeholder="例如 1m", default="1m"),
     FieldSpec(("logs", "query_log_dir"), "查询日志目录"),
 ]
 
@@ -80,10 +83,12 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
     style = ttk.Style(root)
     style.configure("Config.TLabelframe", padding=12)
     style.configure("Config.TLabelframe.Label", font=("", 10, "bold"))
+    style.configure("Placeholder.TEntry", foreground="#888888")
 
     result: dict[str, AppConfig] = {}
-    variables: dict[FieldPath, tk.StringVar] = {}
+    variables: dict[FieldPath, ValueVariable] = {}
     tier_variables: list[tuple[tk.StringVar, tk.StringVar]] = []
+    tier_value_variables: list[tuple[ValueVariable, ValueVariable]] = []
 
     intro = "首次启动已从默认模板生成 config.toml，请确认配置后再进入主界面。" if created else "请确认 config.toml 的本地运行配置。"
     ttk.Label(root, text=intro, anchor="w").pack(fill="x", padx=20, pady=(18, 10))
@@ -113,9 +118,8 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
             current_group_frame.columnconfigure(1, weight=1, minsize=360)
             row += 1
             group_row = 0
-        value = _document_value(document, spec.path)
+        value = _document_value(document, spec.path, spec.default)
         variable = tk.StringVar(value=value)
-        variables[spec.path] = variable
         assert current_group_frame is not None
         ttk.Label(current_group_frame, text=spec.label, width=22, anchor="w").grid(
             row=group_row,
@@ -126,6 +130,7 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
         )
         entry = ttk.Entry(current_group_frame, textvariable=variable, show="*" if spec.secret else "", width=46)
         entry.grid(row=group_row, column=1, sticky="ew", pady=5)
+        variables[spec.path] = PlaceholderEntry(entry, variable, spec.placeholder, show="*" if spec.secret else "")
         group_row += 1
 
     tiers_group = ttk.LabelFrame(form, text="订阅分档", style="Config.TLabelframe")
@@ -139,11 +144,14 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
     def render_tiers() -> None:
         for child in tiers_frame.winfo_children():
             child.destroy()
+        tier_value_variables.clear()
         ttk.Label(tiers_frame, text="min_ratio").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 4))
         ttk.Label(tiers_frame, text="interval").grid(row=0, column=1, sticky="w", padx=(0, 10), pady=(0, 4))
         for index, (min_ratio_var, interval_var) in enumerate(tier_variables, start=1):
             ttk.Entry(tiers_frame, textvariable=min_ratio_var, width=18).grid(row=index, column=0, sticky="ew", padx=(0, 10), pady=4)
-            ttk.Entry(tiers_frame, textvariable=interval_var, width=18).grid(row=index, column=1, sticky="ew", padx=(0, 10), pady=4)
+            interval_entry = ttk.Entry(tiers_frame, textvariable=interval_var, width=18)
+            interval_entry.grid(row=index, column=1, sticky="ew", padx=(0, 10), pady=4)
+            tier_value_variables.append((min_ratio_var, PlaceholderEntry(interval_entry, interval_var, "例如 1m")))
             ttk.Button(
                 tiers_frame,
                 text="删除",
@@ -169,7 +177,7 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
 
     def save_and_continue() -> None:
         try:
-            updated = _document_from_variables(document, variables, tier_variables)
+            updated = _document_from_variables(document, variables, tier_value_variables)
             parsed = parse_config(updated, config_path)
             save_document(updated, config_path)
         except ConfigError as exc:
@@ -192,6 +200,42 @@ def confirm_config_on_startup(config_path: Path = CONFIG_PATH) -> AppConfig:
     return result["config"]
 
 
+class PlaceholderEntry:
+    def __init__(self, entry: ttk.Entry, variable: tk.StringVar, placeholder: str, show: str = "") -> None:
+        self.entry = entry
+        self.variable = variable
+        self.placeholder = placeholder
+        self.show = show
+        self.showing_placeholder = False
+        if placeholder:
+            entry.bind("<FocusIn>", self._clear_placeholder, add="+")
+            entry.bind("<FocusOut>", self._show_placeholder, add="+")
+            if variable.get() == placeholder:
+                self.showing_placeholder = True
+                self.entry.configure(style="Placeholder.TEntry", show="")
+            else:
+                self._show_placeholder()
+
+    def get(self) -> str:
+        if self.showing_placeholder:
+            return ""
+        return self.variable.get()
+
+    def _show_placeholder(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        if self.variable.get() or not self.placeholder:
+            return
+        self.showing_placeholder = True
+        self.entry.configure(style="Placeholder.TEntry", show="")
+        self.variable.set(self.placeholder)
+
+    def _clear_placeholder(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        if not self.showing_placeholder:
+            return
+        self.showing_placeholder = False
+        self.variable.set("")
+        self.entry.configure(style="TEntry", show=self.show)
+
+
 def load_or_confirm_config(config_path: Path = CONFIG_PATH) -> AppConfig:
     try:
         return load_config(config_path)
@@ -199,33 +243,43 @@ def load_or_confirm_config(config_path: Path = CONFIG_PATH) -> AppConfig:
         return confirm_config_on_startup(config_path)
 
 
-def _document_value(document: tomlkit.TOMLDocument, path: FieldPath) -> str:
+def _document_value(document: tomlkit.TOMLDocument, path: FieldPath, fallback: str = "") -> str:
     table: object = document
     for key in path[:-1]:
         if not _is_table_like(table):
-            return ""
+            return fallback
         table = table.get(key)  # type: ignore[attr-defined]
     if _is_table_like(table) and path[-1] in table:
         value = table[path[-1]]
         if isinstance(value, bool):
             return "true" if value else "false"
         return str(value)
-    return ""
+    return fallback
 
 
 def _document_tier_values(document: tomlkit.TOMLDocument) -> list[tuple[str, str]]:
     subscription = _nested_table(document, ("polling", "subscription"))
     if subscription is None:
-        return []
+        return [(str(tier.min_ratio), _format_duration(tier.interval_seconds)) for tier in DEFAULT_SUBSCRIPTION_TIERS]
     raw_tiers = subscription.get("tiers", [])
     if not raw_tiers:
-        return []
+        return [(str(tier.min_ratio), _format_duration(tier.interval_seconds)) for tier in DEFAULT_SUBSCRIPTION_TIERS]
     values: list[tuple[str, str]] = []
     for raw_tier in raw_tiers:
         if not _is_table_like(raw_tier):
             continue
         values.append((str(raw_tier.get("min_ratio", "")), str(raw_tier.get("interval", ""))))
     return values
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds / 3600:g}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds / 60:g}m"
+    if seconds >= 1:
+        return f"{seconds:g}s"
+    return f"{seconds * 1000:g}ms"
 
 
 def _document_from_variables(

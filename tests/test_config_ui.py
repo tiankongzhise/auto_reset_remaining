@@ -16,6 +16,14 @@ class Variable:
         return self.value
 
 
+class PlaceholderVariable:
+    def __init__(self, placeholder: str) -> None:
+        self.placeholder = placeholder
+
+    def get(self) -> str:
+        return ""
+
+
 class ConfigUITests(unittest.TestCase):
     def test_nested_polling_fields_and_tiers_are_written(self) -> None:
         document = tomlkit.parse(_valid_config_text())
@@ -51,6 +59,23 @@ class ConfigUITests(unittest.TestCase):
         self.assertEqual(config.polling.sleep.interval_seconds, 120)
         self.assertTrue(config.polling.after_reset_email.enabled)
         self.assertEqual(config.polling.after_reset_email.interval_seconds, 15)
+
+    def test_placeholder_text_is_not_written_to_document(self) -> None:
+        document = tomlkit.parse(_valid_config_text())
+        variables = {
+            ("rayplus", "balance_json_path"): PlaceholderVariable("可留空；例如 data.balance"),
+            ("reset", "manual_confirm_time_range"): PlaceholderVariable("可留空；例如 22:00-09:00"),
+            ("polling", "after_reset_email", "interval"): Variable("30s"),
+        }
+        tier_variables = [(Variable("0.50"), PlaceholderVariable("例如 1m"))]
+
+        updated = _document_from_variables(document, variables, tier_variables)
+
+        self.assertEqual(updated["rayplus"]["balance_json_path"], "")
+        self.assertEqual(updated["reset"]["manual_confirm_time_range"], "")
+        self.assertEqual(updated["polling"]["subscription"]["tiers"][0]["interval"], "")
+        self.assertNotIn("可留空", tomlkit.dumps(updated))
+        self.assertNotIn("例如 1m", tomlkit.dumps(updated))
 
 
 def _valid_config_text() -> str:
