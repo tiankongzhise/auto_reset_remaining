@@ -68,13 +68,18 @@ enabled = true
 quota = 100
 
 [[polling.subscription.tiers]]
-# 余额比例大于等于 70% 时，每 1 分钟查询一次。
+# 余额比例大于等于 70% 时，每 3 分钟查询一次。
 min_ratio = 0.70
+interval = "3m"
+
+[[polling.subscription.tiers]]
+# 余额比例大于等于 50% 时，每 1 分钟查询一次。
+min_ratio = 0.50
 interval = "1m"
 
 [[polling.subscription.tiers]]
-# 余额比例大于等于 40% 时，每 30 秒查询一次。
-min_ratio = 0.40
+# 余额比例大于等于 30% 时，每 30 秒查询一次。
+min_ratio = 0.30
 interval = "30s"
 
 [[polling.subscription.tiers]]
@@ -82,27 +87,29 @@ interval = "30s"
 min_ratio = 0.20
 interval = "10s"
 
-[[polling.subscription.tiers]]
-# 余额接近耗尽但仍大于 0 时，每 3 秒查询一次。
-min_ratio = 0.000001
-interval = "3s"
 
 [[polling.subscription.tiers]]
-# 余额为 0 或低于所有其他档位时，每 1 秒查询一次。
-min_ratio = 0
+# 余额比例大于等于 10% 时，每 5 秒查询一次。
+min_ratio = 0.10
+interval = "5s"
+
+
+[[polling.subscription.tiers]]
+# 余额比例大于等于 5% 时，每 1 秒查询一次。
+min_ratio = 0.05
 interval = "1s"
+
 
 [polling.sleep]
 # 余额长时间不变时降低查询频率。
-enabled = false
+enabled = true
 unchanged_for = "10m"
-interval = "1m"
+interval = "5m"
 
 [polling.after_reset_email]
 # 创建低余额确认请求后，是否临时使用固定间隔查询，直到余额发生变化。
-enabled = false
+enabled = true
 interval = "1m"
-
 
 [logs]
 # 查询日志目录；程序会按日期写入 query-YYYY-MM-DD.jsonl。
