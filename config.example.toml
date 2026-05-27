@@ -1,6 +1,10 @@
 # auto_reset_remaining 的非密钥运行配置模板。
 # 复制为 config.toml 后修改；账号、密码、接口 key 等敏感项放在 .env 中。
 
+[app]
+# 业务时区；每日 0 点、确认链接过期、人工确认时间段、数据库会话时区和日志展示都使用它。
+timezone = "Asia/Shanghai"
+
 [rayplus]
 # RayPlus Web/API 基础地址；通常保持默认。
 base_url = "https://rayplus.site"

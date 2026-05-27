@@ -12,15 +12,21 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/BurntSushi/toml"
 
 	"auto_reset_remaining/internal/envfile"
 )
 
+const DefaultTimeZone = "Asia/Shanghai"
+
 type Config struct {
 	EnvPath  string
 	TOMLPath string
+
+	TimeZone string
+	Location *time.Location
 
 	RayPlusBaseURL  string
 	RayPlusAPIKey   string
@@ -118,6 +124,7 @@ type timeOfDay struct {
 }
 
 type FileConfig struct {
+	App     FileAppConfig     `toml:"app"`
 	RayPlus FileRayPlusConfig `toml:"rayplus"`
 	Codex   FileCodexConfig   `toml:"codex"`
 	SMTP    FileSMTPConfig    `toml:"smtp"`
@@ -126,6 +133,10 @@ type FileConfig struct {
 	Logs    FileLogsConfig    `toml:"logs"`
 	Reset   FileResetConfig   `toml:"reset"`
 	Polling FilePollingConfig `toml:"polling"`
+}
+
+type FileAppConfig struct {
+	TimeZone string `toml:"timezone"`
 }
 
 type FileRayPlusConfig struct {
@@ -296,6 +307,7 @@ func replaceFile(path string, data []byte) error {
 }
 
 func (c *FileConfig) ApplyDefaults() {
+	c.App.TimeZone = defaultString(c.App.TimeZone, DefaultTimeZone)
 	c.RayPlus.BaseURL = defaultString(c.RayPlus.BaseURL, "https://rayplus.site")
 	c.RayPlus.UserAgent = defaultString(c.RayPlus.UserAgent, "auto-reset-remaining/1.0")
 	c.Codex.BaseURL = defaultString(c.Codex.BaseURL, "https://codex.rayplus.site")
@@ -417,6 +429,10 @@ func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret f
 	if err != nil {
 		return Config{}, err
 	}
+	location, err := loadLocation(fileCfg.App.TimeZone)
+	if err != nil {
+		return Config{}, err
+	}
 
 	tiers := make([]SubscriptionTier, 0, len(fileCfg.Polling.Subscription.Tiers))
 	for _, tier := range fileCfg.Polling.Subscription.Tiers {
@@ -432,6 +448,8 @@ func merge(envPath string, configPath string, fileCfg FileConfig, lookupSecret f
 	cfg := Config{
 		EnvPath:                    envPath,
 		TOMLPath:                   configPath,
+		TimeZone:                   fileCfg.App.TimeZone,
+		Location:                   location,
 		RayPlusBaseURL:             fileCfg.RayPlus.BaseURL,
 		RayPlusAPIKey:              lookupSecret("RAYPLUS_API_KEY"),
 		RayPlusEmail:               lookupSecret("RAYPLUS_EMAIL"),
@@ -594,6 +612,9 @@ func (c Config) Validate() error {
 	if c.ResetCooldown < 0 {
 		return fmt.Errorf("reset.cooldown must not be negative")
 	}
+	if _, err := loadLocation(defaultString(c.TimeZone, DefaultTimeZone)); err != nil {
+		return err
+	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
@@ -662,17 +683,39 @@ func (w ManualConfirmWindow) Contains(t time.Time) bool {
 }
 
 func (c Config) PostgresConnString() string {
+	timeZone := defaultString(c.TimeZone, DefaultTimeZone)
 	parts := []string{
 		"host=" + quotePGValue(c.PG.Host),
 		"port=" + strconv.Itoa(c.PG.Port),
 		"user=" + quotePGValue(c.PG.User),
 		"dbname=" + quotePGValue(c.PG.Database),
 		"sslmode=" + quotePGValue(c.PG.SSLMode),
+		"TimeZone=" + quotePGValue(timeZone),
 	}
 	if c.PG.Password != "" {
 		parts = append(parts, "password="+quotePGValue(c.PG.Password))
 	}
 	return strings.Join(parts, " ")
+}
+
+func (c Config) BusinessLocation() *time.Location {
+	if c.Location != nil {
+		return c.Location
+	}
+	location, err := loadLocation(defaultString(c.TimeZone, DefaultTimeZone))
+	if err != nil {
+		return time.FixedZone(DefaultTimeZone, 8*60*60)
+	}
+	return location
+}
+
+func loadLocation(name string) (*time.Location, error) {
+	name = defaultString(name, DefaultTimeZone)
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("app.timezone %q is invalid: %w", name, err)
+	}
+	return location, nil
 }
 
 func samePath(left, right string) bool {

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -33,6 +34,45 @@ func TestClientQueryBalance(t *testing.T) {
 	}
 	if result.Balance != 0.25 {
 		t.Fatalf("Balance = %v, want 0.25", result.Balance)
+	}
+}
+
+func TestClientValidateUsageAPIKeyRejectsInvalidKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/usage" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"INVALID_API_KEY","message":"Invalid API key"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		RayPlusBaseURL: server.URL,
+		RayPlusAPIKey:  "bad-key",
+		UserAgent:      "test-agent",
+	})
+	err := client.ValidateUsageAPIKey(context.Background())
+	if !errors.Is(err, ErrInvalidAPIKey) {
+		t.Fatalf("ValidateUsageAPIKey() error = %v, want ErrInvalidAPIKey", err)
+	}
+}
+
+func TestClientQueryBalanceClassifiesInvalidAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"INVALID_API_KEY","message":"Invalid API key"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		RayPlusBaseURL: server.URL,
+		RayPlusAPIKey:  "bad-key",
+		UserAgent:      "test-agent",
+	})
+	_, err := client.QueryBalance(context.Background())
+	if !errors.Is(err, ErrInvalidAPIKey) {
+		t.Fatalf("QueryBalance() error = %v, want ErrInvalidAPIKey", err)
 	}
 }
 

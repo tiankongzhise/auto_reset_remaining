@@ -4,7 +4,7 @@
 
 ## 工作流程
 
-1. 服务按配置查询 `GET /v1/usage` 获取当前余额。
+1. 服务按配置查询 `GET /v1/usage` 获取当前余额。该接口是唯一余额来源；如果启动校验明确返回 `INVALID_API_KEY`，服务会直接退出。
 2. 未开启自动重置时，余额低于 `reset.low_balance_threshold` 会发送一封确认邮件。
 3. 用户点击邮件中的 `/confirm-reset?token=...` 链接后，服务调用 Codex 重置订阅额度。
 4. 人工确认重置成功累计 3 次后，服务会在 `config.toml` 中开启 `reset.auto_reset_enabled`。
@@ -68,6 +68,7 @@ CANCEL_RESET_EMAIL_KEY=change-this-cancel-reset-email-key
 
 - `http.public_base_url`：外部访问本服务的地址，例如 `https://your-domain.example.com`。
 - `http.addr`：服务监听地址，例如 `127.0.0.1:8080`。
+- `app.timezone`：业务时区；每日 0 点、确认链接过期、人工确认时间段、数据库会话时区和日志展示都使用它，默认 `Asia/Shanghai`。
 - `smtp.host`、`smtp.port`、`smtp.from`、`smtp.to`：邮件服务器和收件人。
 - `postgres.sslmode`：PostgreSQL SSL 模式。
 - `reset.low_balance_threshold`：低余额邮件阈值。
@@ -122,7 +123,7 @@ GET /generate-replay-nonce?endpoint=/resend-reset-email&key=<RESEND_RESET_EMAIL_
 
 生成接口只生成参数，不会预占用这个参数。真正的防重放记录会在目标接口处理请求前写入数据库；同一个 endpoint 下重复使用相同 `replay_nonce` 会返回 409，并提示防重放参数已经被处理过。不同 endpoint 可以使用相同的 `replay_nonce`。`/confirm-reset?token=...` 不需要 `replay_nonce`，因为它不是直接通过 key 访问的接口。
 
-确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在本地 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`。
+确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在 `app.timezone` 的 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`。
 
 如果自动发送确认邮件失败，或需要让旧确认链接作废并重新发送一封确认邮件，可以调用补发接口：
 
@@ -191,7 +192,7 @@ interval = "1s"
 
 ## 手动确认时间段
 
-`reset.manual_confirm_time_range` 为空表示不启用。
+`reset.manual_confirm_time_range` 为空表示不启用。该时间段按 `app.timezone` 解释。
 
 ```toml
 [reset]
@@ -237,5 +238,5 @@ GET /rotate-logs?key=<LOG_ROTATION_KEY>&replay_nonce=<REPLAY_NONCE>
 - 启动时报 `missing config file config.toml`：复制 `config.example.toml` 为 `config.toml`。
 - 启动时报缺少配置：检查 `.env` 是否按 `.env.example` 填写，`config.toml` 是否按 `config.example.toml` 填写。
 - 邮件确认链接打不开：检查 `http.public_base_url` 是否是收件人能访问的公网地址。
-- 查询余额解析失败：设置 `rayplus.balance_json_path` 指向 usage 响应里的余额字段。
+- 查询余额解析失败：设置 `rayplus.balance_json_path` 指向 usage 响应里的余额字段；如果 `/v1/usage` 明确返回 `INVALID_API_KEY`，请修复 `.env` 里的 `RAYPLUS_API_KEY` 后重启。
 - PostgreSQL 连接失败：检查 `.env` 中的 `pg_host`、`pg_port`、`pg_user`、`pg_password`、`pg_database`，以及 `config.toml` 中的 `postgres.sslmode`。

@@ -26,6 +26,23 @@ func TestParseBalanceDefaultPaths(t *testing.T) {
 	}
 }
 
+func TestParseBalancePrefersUserBalanceOverTopLevelZero(t *testing.T) {
+	got, err := ParseBalance([]byte(`{"balance":0,"data":{"user":{"balance":"76.25"}}}`), "")
+	if err != nil {
+		t.Fatalf("ParseBalance() error = %v", err)
+	}
+	if got != 76.25 {
+		t.Fatalf("ParseBalance() = %v, want 76.25", got)
+	}
+}
+
+func TestParseBalanceRejectsAmbiguousFallback(t *testing.T) {
+	_, err := ParseBalance([]byte(`{"payload":{"balance":0,"account":{"remaining":76.25}}}`), "")
+	if err == nil {
+		t.Fatal("ParseBalance() expected ambiguous fallback error")
+	}
+}
+
 func TestParseBalanceConfiguredPath(t *testing.T) {
 	got, err := ParseBalance([]byte(`{"payload":{"usage":[{"left":"1.25"}]}}`), "payload.usage.0.left")
 	if err != nil {

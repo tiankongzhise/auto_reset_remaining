@@ -57,8 +57,14 @@ func TestLoadSplitsSecretsAndTOMLConfig(t *testing.T) {
 	if cfg.TestResetEmailKey != "test-secret" || cfg.CancelResetEmailKey != "cancel-secret" {
 		t.Fatalf("unexpected endpoint keys: test=%q cancel=%q", cfg.TestResetEmailKey, cfg.CancelResetEmailKey)
 	}
+	if cfg.TimeZone != "Asia/Shanghai" {
+		t.Fatalf("TimeZone = %q, want Asia/Shanghai", cfg.TimeZone)
+	}
+	if got := cfg.BusinessLocation().String(); got != "Asia/Shanghai" {
+		t.Fatalf("BusinessLocation = %q, want Asia/Shanghai", got)
+	}
 	conn := cfg.PostgresConnString()
-	for _, part := range []string{"host=localhost", "port=15432", "user='pg user'", "password='pg password'", "dbname=auto_reset", "sslmode=require"} {
+	for _, part := range []string{"host=localhost", "port=15432", "user='pg user'", "password='pg password'", "dbname=auto_reset", "sslmode=require", "TimeZone=Asia/Shanghai"} {
 		if !strings.Contains(conn, part) {
 			t.Fatalf("PostgresConnString() = %q, missing %q", conn, part)
 		}
@@ -97,6 +103,14 @@ func TestValidateRejectsNegativeDailyMaxResetCount(t *testing.T) {
 	cfg.DailyMaxResetCount = -1
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "daily_max_reset_count") {
 		t.Fatalf("Validate() error = %v, want daily_max_reset_count error", err)
+	}
+}
+
+func TestValidateRejectsInvalidTimeZone(t *testing.T) {
+	cfg := validConfig()
+	cfg.TimeZone = "Mars/Olympus"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "app.timezone") {
+		t.Fatalf("Validate() error = %v, want app.timezone error", err)
 	}
 }
 
@@ -140,6 +154,7 @@ func TestExternalManualResetEnabledRequiresKey(t *testing.T) {
 
 func validConfig() Config {
 	return Config{
+		TimeZone:            "Asia/Shanghai",
 		RayPlusBaseURL:      "https://rayplus.site",
 		RayPlusAPIKey:       "sk-test",
 		RayPlusEmail:        "user@example.com",
@@ -177,6 +192,9 @@ func validConfig() Config {
 
 func baseConfigTOML() string {
 	return `
+[app]
+timezone = "Asia/Shanghai"
+
 [rayplus]
 base_url = "https://rayplus.site"
 user_agent = "auto-reset-remaining/1.0"

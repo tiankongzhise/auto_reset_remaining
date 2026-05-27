@@ -66,6 +66,17 @@ func main() {
 		BalanceJSONPath: cfg.BalanceJSONPath,
 		UserAgent:       cfg.UserAgent,
 	})
+	usageCtx, usageCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := apiClient.ValidateUsageAPIKey(usageCtx); err != nil {
+		usageCancel()
+		if errors.Is(err, api.ErrInvalidAPIKey) {
+			logger.Fatalf("validate RayPlus usage API key: %v", err)
+		}
+		logger.Printf("RayPlus usage API startup check did not complete; continuing because this can be transient: %v", err)
+	} else {
+		usageCancel()
+		logger.Print("RayPlus usage API key validated")
+	}
 	sender := mailer.NewSMTPMailer(cfg.SMTP)
 	queryLogger := service.NewQueryLogger(cfg.QueryLogDir)
 	logRotator := service.NewLogRotator(cfg, queryLogger, logger)

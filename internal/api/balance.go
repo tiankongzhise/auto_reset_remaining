@@ -9,9 +9,9 @@ import (
 )
 
 var defaultBalancePaths = []string{
-	"balance",
-	"data.balance",
 	"data.user.balance",
+	"data.balance",
+	"balance",
 	"remaining",
 	"data.remaining",
 	"quota.remaining",
@@ -55,17 +55,22 @@ func ParseBalance(body []byte, configuredPath string) (float64, error) {
 		}
 	}
 
-	if value, ok := findByKey(payload, map[string]bool{
+	candidates := findByKey(payload, map[string]bool{
 		"balance":           true,
 		"remaining":         true,
 		"credits_remaining": true,
 		"available_balance": true,
 		"total_available":   true,
 		"remain_quota":      true,
-	}); ok {
-		return numberFromAny(value)
+	})
+	switch len(candidates) {
+	case 0:
+		return 0, errors.New("could not find balance field in usage response; set BALANCE_JSON_PATH")
+	case 1:
+		return numberFromAny(candidates[0].value)
+	default:
+		return balanceFromCandidates(candidates)
 	}
-	return 0, errors.New("could not find balance field in usage response; set BALANCE_JSON_PATH")
 }
 
 func lookupPath(payload any, path string) (any, bool) {
@@ -95,27 +100,68 @@ func lookupPath(payload any, path string) (any, bool) {
 	return current, true
 }
 
-func findByKey(payload any, keys map[string]bool) (any, bool) {
+type balanceCandidate struct {
+	path  string
+	value any
+}
+
+func findByKey(payload any, keys map[string]bool) []balanceCandidate {
+	var candidates []balanceCandidate
+	findByKeyAt(payload, keys, "", &candidates)
+	return candidates
+}
+
+func findByKeyAt(payload any, keys map[string]bool, path string, candidates *[]balanceCandidate) {
 	switch typed := payload.(type) {
 	case map[string]any:
 		for key, value := range typed {
 			if keys[strings.ToLower(key)] {
-				return value, true
+				*candidates = append(*candidates, balanceCandidate{
+					path:  appendPath(path, key),
+					value: value,
+				})
 			}
 		}
-		for _, value := range typed {
-			if found, ok := findByKey(value, keys); ok {
-				return found, true
-			}
+		for key, value := range typed {
+			findByKeyAt(value, keys, appendPath(path, key), candidates)
 		}
 	case []any:
-		for _, value := range typed {
-			if found, ok := findByKey(value, keys); ok {
-				return found, true
-			}
+		for index, value := range typed {
+			findByKeyAt(value, keys, appendPath(path, strconv.Itoa(index)), candidates)
 		}
 	}
-	return nil, false
+}
+
+func appendPath(base string, part string) string {
+	if base == "" {
+		return part
+	}
+	return base + "." + part
+}
+
+func balanceFromCandidates(candidates []balanceCandidate) (float64, error) {
+	var first float64
+	firstSet := false
+	firstPath := ""
+	for _, candidate := range candidates {
+		value, err := numberFromAny(candidate.value)
+		if err != nil {
+			continue
+		}
+		if !firstSet {
+			first = value
+			firstSet = true
+			firstPath = candidate.path
+			continue
+		}
+		if value != first {
+			return 0, fmt.Errorf("found multiple possible balance fields (%s and %s); set BALANCE_JSON_PATH", firstPath, candidate.path)
+		}
+	}
+	if !firstSet {
+		return 0, fmt.Errorf("found possible balance fields but none were numeric; set BALANCE_JSON_PATH")
+	}
+	return first, nil
 }
 
 func numberFromAny(value any) (float64, error) {

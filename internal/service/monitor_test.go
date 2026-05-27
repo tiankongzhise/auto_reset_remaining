@@ -101,6 +101,40 @@ func TestConfirmEmailExpiryCapsAtMidnight(t *testing.T) {
 	}
 }
 
+func TestConfirmEmailExpiryUsesConfiguredBusinessTimeZone(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		nowUTC time.Time
+		want   time.Time
+	}{
+		{
+			name:   "before local midnight",
+			nowUTC: time.Date(2026, 5, 26, 15, 43, 0, 0, time.UTC),
+			want:   time.Date(2026, 5, 27, 0, 0, 0, 0, shanghai),
+		},
+		{
+			name:   "after local midnight",
+			nowUTC: time.Date(2026, 5, 26, 22, 43, 0, 0, time.UTC),
+			want:   time.Date(2026, 5, 28, 0, 0, 0, 0, shanghai),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := confirmTokenExpiresAt(tc.nowUTC.In(shanghai), 24*time.Hour)
+			if !got.Equal(tc.want) {
+				t.Fatalf("confirmTokenExpiresAt() = %s, want %s", got, tc.want)
+			}
+			if reason != store.ConfirmTokenExpireReasonAutoReset {
+				t.Fatalf("expire reason = %s, want auto_reset", reason)
+			}
+		})
+	}
+}
+
 func TestConfirmThirdManualSuccessEnablesAutoReset(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0.4, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
@@ -749,6 +783,32 @@ func TestDailyLimitSendsPlanEmailThenPausesQueries(t *testing.T) {
 	}
 }
 
+func TestDailyLimitStateUsesBusinessTimeZone(t *testing.T) {
+	ctx := context.Background()
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, &fakeAPI{}, &fakeMailer{}, dataStore, config.Config{
+		DailyMaxResetCount: 1,
+		TimeZone:           "Asia/Shanghai",
+		Location:           shanghai,
+	})
+
+	nowUTC := time.Date(2026, 5, 26, 22, 43, 0, 0, time.UTC)
+	state, err := monitor.dailyResetLimitState(ctx, monitor.snapshot(), nowUTC)
+	if err != nil {
+		t.Fatalf("dailyResetLimitState() error = %v", err)
+	}
+	if got := state.Day.Format(time.RFC3339); got != "2026-05-27T00:00:00+08:00" {
+		t.Fatalf("state day = %s, want 2026-05-27T00:00:00+08:00", got)
+	}
+	if _, ok := dataStore.daily["2026-05-27"]; !ok {
+		t.Fatalf("daily state keys = %+v, want 2026-05-27", dataStore.daily)
+	}
+}
+
 func TestConfirmRejectsWhenDailyLimitReachedWithoutConsumingToken(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0.4, resetResult: api.ResetResult{SubscriptionID: 1716, HTTPStatus: 200, Success: true}}
@@ -890,8 +950,18 @@ func TestReplayNonceStoreSemantics(t *testing.T) {
 func newTestMonitor(t *testing.T, apiClient *fakeAPI, sender *fakeMailer, dataStore *fakeStore, overrides config.Config) *Monitor {
 	t.Helper()
 	configPath := writeConfig(t, overrides.ManualConfirmSuccessCount, overrides.AutoResetEnabled)
+	location := overrides.Location
+	if location == nil {
+		location = time.FixedZone("Asia/Shanghai", 8*60*60)
+	}
+	timeZone := overrides.TimeZone
+	if timeZone == "" {
+		timeZone = "Asia/Shanghai"
+	}
 	cfg := config.Config{
 		TOMLPath:                   configPath,
+		TimeZone:                   timeZone,
+		Location:                   location,
 		PublicBaseURL:              "https://service.example.com",
 		LowBalanceThreshold:        0.5,
 		ConfirmTokenTTL:            time.Hour,
@@ -996,6 +1066,9 @@ func mustManualConfirmWindow(t *testing.T, value string) config.ManualConfirmWin
 }
 
 const testServiceConfigTOML = `
+[app]
+timezone = "Asia/Shanghai"
+
 [rayplus]
 base_url = "https://rayplus.site"
 user_agent = "auto-reset-remaining/1.0"

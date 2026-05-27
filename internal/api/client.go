@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 )
+
+var ErrInvalidAPIKey = errors.New("rayplus API key is invalid")
 
 type Config struct {
 	RayPlusBaseURL  string
@@ -60,9 +63,39 @@ func NewClient(cfg Config) *Client {
 }
 
 func (c *Client) QueryBalance(ctx context.Context) (BalanceResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(c.cfg.RayPlusBaseURL, "/v1/usage"), nil)
+	resp, body, err := c.doUsage(ctx)
 	if err != nil {
 		return BalanceResult{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return BalanceResult{}, usageHTTPError(resp.StatusCode, body)
+	}
+	balance, err := ParseBalance(body, c.cfg.BalanceJSONPath)
+	if err != nil {
+		return BalanceResult{}, err
+	}
+	return BalanceResult{Balance: balance, Raw: append([]byte(nil), body...)}, nil
+}
+
+func (c *Client) ValidateUsageAPIKey(ctx context.Context) error {
+	resp, body, err := c.doUsage(ctx)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	err = usageHTTPError(resp.StatusCode, body)
+	if errors.Is(err, ErrInvalidAPIKey) {
+		return err
+	}
+	return err
+}
+
+func (c *Client) doUsage(ctx context.Context) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(c.cfg.RayPlusBaseURL, "/v1/usage"), nil)
+	if err != nil {
+		return nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.cfg.RayPlusAPIKey)
 	req.Header.Set("Accept", "application/json")
@@ -72,21 +105,11 @@ func (c *Client) QueryBalance(ctx context.Context) (BalanceResult, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return BalanceResult{}, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		return BalanceResult{}, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return BalanceResult{}, fmt.Errorf("usage API returned HTTP %d: %s", resp.StatusCode, summarize(body))
-	}
-	balance, err := ParseBalance(body, c.cfg.BalanceJSONPath)
-	if err != nil {
-		return BalanceResult{}, err
-	}
-	return BalanceResult{Balance: balance, Raw: append([]byte(nil), body...)}, nil
+	return resp, body, err
 }
 
 func (c *Client) ResetQuota(ctx context.Context) (ResetResult, error) {
@@ -285,4 +308,21 @@ func summarize(body []byte) string {
 		return text[:1000] + "...(truncated)"
 	}
 	return text
+}
+
+func usageHTTPError(status int, body []byte) error {
+	if usageErrorCode(body) == "INVALID_API_KEY" {
+		return fmt.Errorf("%w: usage API returned HTTP %d", ErrInvalidAPIKey, status)
+	}
+	return fmt.Errorf("usage API returned HTTP %d: %s", status, summarize(body))
+}
+
+func usageErrorCode(body []byte) string {
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Code)
 }

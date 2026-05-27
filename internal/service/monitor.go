@@ -141,7 +141,7 @@ func (m *Monitor) Initialize(ctx context.Context) error {
 	m.mu.Lock()
 	m.pendingManualEmail = pending
 	m.mu.Unlock()
-	m.logPollingStartup(time.Now())
+	m.logPollingStartup(m.businessNow(m.snapshot()))
 	return nil
 }
 
@@ -169,14 +169,14 @@ func (m *Monitor) tickAndLog(ctx context.Context) time.Duration {
 	if err != nil {
 		m.logger.Printf("tick status=%s error=%v", status, err)
 	}
-	policy := m.nextPollPolicy(time.Now())
+	policy := m.nextPollPolicy(m.businessNow(m.snapshot()))
 	m.logPollingPolicy(policy, "tick", false)
 	return policy.Interval
 }
 
 func (m *Monitor) handleTick(ctx context.Context) (string, error) {
-	start := time.Now()
 	cfg := m.snapshot()
+	start := m.businessNow(cfg)
 	state, stateErr := m.dailyResetLimitState(ctx, cfg, start)
 	if stateErr != nil {
 		entry := QueryLogEntry{
@@ -230,7 +230,7 @@ func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 	entry.Balance = &result.Balance
 	m.observeBalance(start, result.Balance)
 
-	status, actionErr := m.handleBalance(ctx, result.Balance)
+	status, actionErr := m.handleBalance(ctx, result.Balance, start)
 	entry.Status = status
 	entry.DurationMS = time.Since(start).Milliseconds()
 	if actionErr != nil {
@@ -242,9 +242,10 @@ func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 	return status, actionErr
 }
 
-func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, error) {
+func (m *Monitor) handleBalance(ctx context.Context, balance float64, now time.Time) (string, error) {
 	cfg := m.snapshot()
-	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	now = now.In(cfg.BusinessLocation())
+	state, err := m.dailyResetLimitState(ctx, cfg, now)
 	if err != nil {
 		return "daily_reset_limit_state_error", err
 	}
@@ -256,7 +257,7 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64) (string, e
 	}
 	if cfg.AutoResetEnabled {
 		if balance <= 0 {
-			if cfg.ManualConfirmWindow.Contains(time.Now()) {
+			if cfg.ManualConfirmWindow.Contains(now) {
 				return m.maybeSendConfirmEmail(ctx, balance, cfg, "manual_confirm")
 			}
 			return m.maybeAutoReset(ctx, balance, cfg.ResetCooldown)
@@ -329,7 +330,8 @@ func (m *Monitor) ResendConfirmEmail(ctx context.Context, key string) (ResendCon
 		m.logger.Printf("resend confirm email balance query failed error=%v", err)
 		return ResendConfirmEmailResult{}, err
 	}
-	m.observeBalance(time.Now(), result.Balance)
+	cfg = m.snapshot()
+	m.observeBalance(m.businessNow(cfg), result.Balance)
 
 	sendResult, err := m.sendConfirmEmail(ctx, result.Balance, cfg, "resend_confirm")
 	if err != nil {
@@ -360,7 +362,8 @@ func (m *Monitor) ManualReset(ctx context.Context, key string) (ManualResetResul
 		m.logger.Printf("external manual reset balance query failed error=%v", err)
 		return ManualResetResult{}, err
 	}
-	m.observeBalance(time.Now(), result.Balance)
+	cfg = m.snapshot()
+	m.observeBalance(m.businessNow(cfg), result.Balance)
 
 	if err := m.ensureResetAllowed(ctx, cfg, "external manual reset"); err != nil {
 		return ManualResetResult{Balance: result.Balance, Status: "external_manual_reset_rejected"}, err
@@ -407,7 +410,8 @@ func (m *Monitor) TestResetEmail(ctx context.Context, key string) (TestResetEmai
 		m.logger.Printf("test reset email balance query failed error=%v", err)
 		return TestResetEmailResult{}, err
 	}
-	m.observeBalance(time.Now(), result.Balance)
+	cfg = m.snapshot()
+	m.observeBalance(m.businessNow(cfg), result.Balance)
 
 	if _, err := m.store.LogReset(ctx, store.ResetLog{
 		Mode:            "external_manual_test",
@@ -455,6 +459,8 @@ func (m *Monitor) CancelResetEmails(ctx context.Context, key string) (CancelRese
 }
 
 func (m *Monitor) sendStartupInvalidatedConfirmTokensEmail(ctx context.Context, tokens []store.InvalidatedConfirmToken) error {
+	cfg := m.snapshot()
+	location := cfg.BusinessLocation()
 	subject := "重置链接已因服务重启失效"
 	var body strings.Builder
 	body.WriteString("服务启动自检发现存在已发送但尚未点击确认的重置链接。\n\n")
@@ -462,9 +468,9 @@ func (m *Monitor) sendStartupInvalidatedConfirmTokensEmail(ctx context.Context, 
 	for i, token := range tokens {
 		body.WriteString(fmt.Sprintf("\n%d. 旧链接：/confirm-reset?token=<token_hash_prefix:%s>\n", i+1, tokenHashPrefix(token.TokenHash)))
 		body.WriteString(fmt.Sprintf("   余额：%.6f\n", token.Balance))
-		body.WriteString(fmt.Sprintf("   发送时间：%s\n", formatEmailTime(token.EmailSentAt)))
-		body.WriteString(fmt.Sprintf("   原过期时间：%s\n", formatEmailTime(token.ExpiresAt)))
-		body.WriteString(fmt.Sprintf("   失效时间：%s\n", formatEmailTime(token.InvalidatedAt)))
+		body.WriteString(fmt.Sprintf("   发送时间：%s\n", formatEmailTime(token.EmailSentAt, location)))
+		body.WriteString(fmt.Sprintf("   原过期时间：%s\n", formatEmailTime(token.ExpiresAt, location)))
+		body.WriteString(fmt.Sprintf("   失效时间：%s\n", formatEmailTime(token.InvalidatedAt, location)))
 	}
 	return m.mailer.Send(ctx, subject, body.String())
 }
@@ -483,7 +489,8 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		m.notifyConfirmURLFailure(ctx, cfg, balance, statusPrefix, "confirm token creation failed", err)
 		return ResendConfirmEmailResult{Balance: balance, Status: "confirm_token_error"}, err
 	}
-	expiresAt, expireReason := confirmTokenExpiresAt(time.Now(), cfg.ConfirmTokenTTL)
+	now := m.businessNow(cfg)
+	expiresAt, expireReason := confirmTokenExpiresAt(now, cfg.ConfirmTokenTTL)
 	if err := m.store.CreateConfirmToken(ctx, tokenHash, balance, expiresAt, expireReason); err != nil {
 		m.logger.Printf("confirm email token store failed status_prefix=%s balance=%.6f token_hash_prefix=%s error=%v", statusPrefix, balance, tokenHashPrefix(tokenHash), err)
 		m.notifyConfirmURLFailure(ctx, cfg, balance, statusPrefix, "confirm token store failed", err)
@@ -526,7 +533,7 @@ func (m *Monitor) sendConfirmEmail(ctx context.Context, balance float64, cfg con
 		m.forceFastReferenceBalance = balance
 	}
 	m.mu.Unlock()
-	policy := m.nextPollPolicy(time.Now())
+	policy := m.nextPollPolicy(now)
 	m.logger.Printf("confirm email sent status_prefix=%s balance=%.6f expires_at=%s token_hash_prefix=%s invalidated_old_links=%d after_reset_email_polling=%t",
 		statusPrefix, balance, expiresAt.Format(time.RFC3339), tokenHashPrefix(tokenHash), invalidated, cfg.Polling.AfterResetEmail.Enabled)
 	return ResendConfirmEmailResult{
@@ -614,7 +621,7 @@ func (m *Monitor) Confirm(ctx context.Context, rawToken string) (ConfirmResult, 
 	m.logger.Printf("confirm reset URL requested token_hash_prefix=%s", tokenPrefix)
 
 	cfg := m.snapshot()
-	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	state, err := m.dailyResetLimitState(ctx, cfg, m.businessNow(cfg))
 	if err != nil {
 		m.logger.Printf("confirm reset URL rejected token_hash_prefix=%s reason=daily_limit_state_error error=%v", tokenPrefix, err)
 		return ConfirmResult{}, err
@@ -708,7 +715,7 @@ func (m *Monitor) executeReset(ctx context.Context, mode string, balance float64
 }
 
 func (m *Monitor) ensureResetAllowed(ctx context.Context, cfg config.Config, event string) error {
-	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	state, err := m.dailyResetLimitState(ctx, cfg, m.businessNow(cfg))
 	if err != nil {
 		m.logger.Printf("%s rejected reason=daily_limit_state_error error=%v", event, err)
 		return err
@@ -757,7 +764,7 @@ func (m *Monitor) notifyDailyLimitAfterReset(ctx context.Context) {
 	if cfg.DailyMaxResetCount <= 0 {
 		return
 	}
-	state, err := m.dailyResetLimitState(ctx, cfg, time.Now())
+	state, err := m.dailyResetLimitState(ctx, cfg, m.businessNow(cfg))
 	if err != nil {
 		m.logger.Printf("daily reset limit state check failed after reset error=%v", err)
 		return
@@ -808,7 +815,7 @@ func (m *Monitor) dailyResetLimitState(ctx context.Context, cfg config.Config, n
 	if cfg.DailyMaxResetCount <= 0 {
 		return store.DailyResetLimitState{}, nil
 	}
-	return m.store.GetDailyResetLimitState(ctx, now, cfg.DailyMaxResetCount)
+	return m.store.GetDailyResetLimitState(ctx, now.In(cfg.BusinessLocation()), cfg.DailyMaxResetCount)
 }
 
 func (m *Monitor) ensureDailyLimitEmail(ctx context.Context, cfg config.Config, state store.DailyResetLimitState) (string, error) {
@@ -874,6 +881,10 @@ func (m *Monitor) snapshot() config.Config {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.cfg
+}
+
+func (m *Monitor) businessNow(cfg config.Config) time.Time {
+	return time.Now().In(cfg.BusinessLocation())
 }
 
 func (m *Monitor) observeBalance(now time.Time, balance float64) {
@@ -1141,11 +1152,11 @@ func tokenHashPrefix(tokenHash string) string {
 	return tokenHash[:12]
 }
 
-func formatEmailTime(t time.Time) string {
+func formatEmailTime(t time.Time, location *time.Location) string {
 	if t.IsZero() {
 		return ""
 	}
-	return t.Format("2006-01-02 15:04:05 MST")
+	return t.In(location).Format("2006-01-02 15:04:05 MST")
 }
 
 func summarizeError(err error) string {
