@@ -38,8 +38,9 @@ type InvalidatedConfirmToken struct {
 type ConfirmTokenExpireReason string
 
 const (
-	ConfirmTokenExpireReasonTTL       ConfirmTokenExpireReason = "ttl"
-	ConfirmTokenExpireReasonAutoReset ConfirmTokenExpireReason = "auto_reset"
+	ConfirmTokenExpireReasonTTL        ConfirmTokenExpireReason = "ttl"
+	ConfirmTokenExpireReasonAutoReset  ConfirmTokenExpireReason = "auto_reset"
+	ConfirmTokenExpireReasonOtherReset ConfirmTokenExpireReason = "other_reset"
 )
 
 type DailyResetLimitState struct {
@@ -58,6 +59,7 @@ type Store interface {
 	DeleteOtherActiveConfirmTokens(ctx context.Context, keepTokenHash string) (int64, error)
 	CancelUnverifiedConfirmEmails(ctx context.Context) (int64, error)
 	InvalidateActiveConfirmTokensOnStartup(ctx context.Context) ([]InvalidatedConfirmToken, error)
+	InvalidateActiveConfirmTokensForOtherReset(ctx context.Context) ([]InvalidatedConfirmToken, error)
 	ExpireAutoResetInvalidatedConfirmTokens(ctx context.Context) (int64, error)
 	HasActiveConfirmToken(ctx context.Context) (bool, error)
 	MarkConfirmTokenEmailSent(ctx context.Context, tokenHash string) error
@@ -122,6 +124,8 @@ func (p *Postgres) Init(ctx context.Context) error {
 			WHEN used_at IS NOT NULL THEN 'used'
 			WHEN status = 'manual_cancelled' THEN 'manual_cancelled'
 			WHEN status = 'auto_reset_expired' THEN 'auto_reset_expired'
+			WHEN status = 'other_reset_expired' THEN 'other_reset_expired'
+			WHEN email_sent_at IS NOT NULL AND expire_reason = 'other_reset' THEN 'other_reset_expired'
 			WHEN email_sent_at IS NOT NULL AND expires_at > now() THEN 'email_sent'
 			WHEN email_sent_at IS NOT NULL AND expire_reason = 'auto_reset' THEN 'auto_reset_expired'
 			WHEN email_sent_at IS NOT NULL THEN 'expired'
@@ -207,6 +211,37 @@ func (p *Postgres) InvalidateActiveConfirmTokensOnStartup(ctx context.Context) (
 	rows, err := p.db.QueryContext(ctx,
 		`UPDATE confirm_tokens
 		 SET status = 'startup_self_check_expired',
+		     invalidated_at = now()
+		 WHERE email_sent_at IS NOT NULL
+		   AND used_at IS NULL
+		   AND status = 'email_sent'
+		   AND expires_at > now()
+		 RETURNING token_hash, balance, created_at, email_sent_at, expires_at, invalidated_at`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []InvalidatedConfirmToken
+	for rows.Next() {
+		var token InvalidatedConfirmToken
+		if err := rows.Scan(&token.TokenHash, &token.Balance, &token.CreatedAt, &token.EmailSentAt, &token.ExpiresAt, &token.InvalidatedAt); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return tokens, nil
+}
+
+func (p *Postgres) InvalidateActiveConfirmTokensForOtherReset(ctx context.Context) ([]InvalidatedConfirmToken, error) {
+	rows, err := p.db.QueryContext(ctx,
+		`UPDATE confirm_tokens
+		 SET status = 'other_reset_expired',
+		     expire_reason = 'other_reset',
 		     invalidated_at = now()
 		 WHERE email_sent_at IS NOT NULL
 		   AND used_at IS NULL

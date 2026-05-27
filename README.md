@@ -123,7 +123,7 @@ GET /generate-replay-nonce?endpoint=/resend-reset-email&key=<RESEND_RESET_EMAIL_
 
 生成接口只生成参数，不会预占用这个参数。真正的防重放记录会在目标接口处理请求前写入数据库；同一个 endpoint 下重复使用相同 `replay_nonce` 会返回 409，并提示防重放参数已经被处理过。不同 endpoint 可以使用相同的 `replay_nonce`。`/confirm-reset?token=...` 不需要 `replay_nonce`，因为它不是直接通过 key 访问的接口。
 
-确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在 `app.timezone` 的 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`。
+确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在 `app.timezone` 的 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`。如果发送确认邮件后余额查询发现当前余额已经恢复到 `reset.low_balance_threshold` 及以上，服务会将未点击的确认链接标记为 `other_reset_expired`，并发送邮件提示余额已经通过其他方式恢复，旧重置链接已自动失效。
 
 如果自动发送确认邮件失败，或需要让旧确认链接作废并重新发送一封确认邮件，可以调用补发接口：
 
@@ -159,7 +159,7 @@ GET /cancel-reset-emails?key=<CANCEL_RESET_EMAIL_KEY>&replay_nonce=<REPLAY_NONCE
 
 查询间隔按优先级从高到低计算：
 
-1. `polling.after_reset_email`：发送重置确认邮件后，固定按该间隔查询，直到余额发生变化。
+1. `polling.after_reset_email`：发送重置确认邮件后，固定按该间隔查询，直到余额发生变化；如果余额恢复到 `reset.low_balance_threshold` 及以上，未点击的重置链接会自动失效并退出该临时查询策略。
 2. `polling.sleep`：余额持续不变达到 `unchanged_for` 后，使用休眠查询间隔。
 3. `polling.subscription`：按剩余额度比例匹配 tiers。
 4. `polling.default_interval`：默认查询间隔。

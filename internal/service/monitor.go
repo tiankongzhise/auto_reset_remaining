@@ -250,10 +250,18 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64, now time.T
 		return "daily_reset_limit_state_error", err
 	}
 	if state.MaxResetCount > 0 && state.ResetCount >= state.MaxResetCount {
+		if balance >= cfg.LowBalanceThreshold {
+			if status, err := m.handleRecoveredBalance(ctx, balance, cfg); err != nil || status != "ok" {
+				return status, err
+			}
+		}
 		if balance <= 0 {
 			return m.maybeSendPlanRefreshLimitEmail(ctx, balance, cfg, state)
 		}
 		return "daily_reset_limit_reached", nil
+	}
+	if balance >= cfg.LowBalanceThreshold {
+		return m.handleRecoveredBalance(ctx, balance, cfg)
 	}
 	if cfg.AutoResetEnabled {
 		if balance <= 0 {
@@ -265,14 +273,33 @@ func (m *Monitor) handleBalance(ctx context.Context, balance float64, now time.T
 		return "ok", nil
 	}
 
-	if balance >= cfg.LowBalanceThreshold {
-		m.mu.Lock()
-		m.pendingManualEmail = false
-		m.mu.Unlock()
+	return m.maybeSendConfirmEmail(ctx, balance, cfg, "low_balance")
+}
+
+func (m *Monitor) handleRecoveredBalance(ctx context.Context, balance float64, cfg config.Config) (string, error) {
+	invalidated, err := m.store.InvalidateActiveConfirmTokensForOtherReset(ctx)
+	if err != nil {
+		m.logger.Printf("balance recovery confirm token invalidation failed balance=%.6f threshold=%.6f error=%v", balance, cfg.LowBalanceThreshold, err)
+		return "balance_recovered_confirm_link_invalidation_error", err
+	}
+
+	m.mu.Lock()
+	m.pendingManualEmail = false
+	m.forceFastUntilBalanceChange = false
+	m.mu.Unlock()
+
+	if len(invalidated) == 0 {
 		return "ok", nil
 	}
 
-	return m.maybeSendConfirmEmail(ctx, balance, cfg, "low_balance")
+	if err := m.sendBalanceRecoveredInvalidatedConfirmTokensEmail(ctx, cfg, balance, invalidated); err != nil {
+		m.logger.Printf("balance recovery confirm token invalidation notification failed balance=%.6f threshold=%.6f invalidated=%d error=%v",
+			balance, cfg.LowBalanceThreshold, len(invalidated), err)
+		return "balance_recovered_confirm_links_notification_error", err
+	}
+	m.logger.Printf("balance recovery invalidated active confirm tokens balance=%.6f threshold=%.6f invalidated=%d",
+		balance, cfg.LowBalanceThreshold, len(invalidated))
+	return "balance_recovered_confirm_links_invalidated", nil
 }
 
 func (m *Monitor) maybeSendConfirmEmail(ctx context.Context, balance float64, cfg config.Config, statusPrefix string) (string, error) {
@@ -468,6 +495,29 @@ func (m *Monitor) sendStartupInvalidatedConfirmTokensEmail(ctx context.Context, 
 	for i, token := range tokens {
 		body.WriteString(fmt.Sprintf("\n%d. 旧链接：/confirm-reset?token=<token_hash_prefix:%s>\n", i+1, tokenHashPrefix(token.TokenHash)))
 		body.WriteString(fmt.Sprintf("   余额：%.6f\n", token.Balance))
+		body.WriteString(fmt.Sprintf("   发送时间：%s\n", formatEmailTime(token.EmailSentAt, location)))
+		body.WriteString(fmt.Sprintf("   原过期时间：%s\n", formatEmailTime(token.ExpiresAt, location)))
+		body.WriteString(fmt.Sprintf("   失效时间：%s\n", formatEmailTime(token.InvalidatedAt, location)))
+	}
+	return m.mailer.Send(ctx, subject, body.String())
+}
+
+func (m *Monitor) sendBalanceRecoveredInvalidatedConfirmTokensEmail(ctx context.Context, cfg config.Config, balance float64, tokens []store.InvalidatedConfirmToken) error {
+	freshCfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("balance recovery notification config refresh failed error=%v", refreshErr)
+	} else {
+		cfg = freshCfg
+	}
+
+	location := cfg.BusinessLocation()
+	subject := "余额已恢复，之前的重置链接已自动失效"
+	var body strings.Builder
+	body.WriteString(fmt.Sprintf("当前余额已经恢复到低余额阈值及以上，因此系统判定订阅额度已经通过其他方式恢复。\n\n当前余额：%.6f\n低余额阈值：%.6f\n失效链接数量：%d\n\n", balance, cfg.LowBalanceThreshold, len(tokens)))
+	body.WriteString("以下未点击的重置确认链接已经自动失效。请忽略之前的重置邮件，避免同一次余额不足触发多次重置。\n")
+	for i, token := range tokens {
+		body.WriteString(fmt.Sprintf("\n%d. 旧链接：/confirm-reset?token=<token_hash_prefix:%s>\n", i+1, tokenHashPrefix(token.TokenHash)))
+		body.WriteString(fmt.Sprintf("   触发时余额：%.6f\n", token.Balance))
 		body.WriteString(fmt.Sprintf("   发送时间：%s\n", formatEmailTime(token.EmailSentAt, location)))
 		body.WriteString(fmt.Sprintf("   原过期时间：%s\n", formatEmailTime(token.ExpiresAt, location)))
 		body.WriteString(fmt.Sprintf("   失效时间：%s\n", formatEmailTime(token.InvalidatedAt, location)))

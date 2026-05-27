@@ -43,6 +43,79 @@ func TestLowBalanceSendsOneEmail(t *testing.T) {
 	}
 }
 
+func TestRecoveredBalanceInvalidatesPendingConfirmURLAndNotifies(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("low balance Tick() error = %v", err)
+	}
+	if status != "low_balance_email_sent" {
+		t.Fatalf("low balance Tick() status = %s, want low_balance_email_sent", status)
+	}
+	rawToken := extractToken(t, sender.messages[0])
+	tokenHash := hashToken(rawToken)
+
+	apiClient.balance = 0.75
+	status, err = monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("recovered Tick() error = %v", err)
+	}
+	if status != "balance_recovered_confirm_links_invalidated" {
+		t.Fatalf("recovered Tick() status = %s, want balance_recovered_confirm_links_invalidated", status)
+	}
+	if apiClient.resetCalls != 0 {
+		t.Fatalf("resetCalls = %d, want 0", apiClient.resetCalls)
+	}
+	if got := len(sender.messages); got != 2 {
+		t.Fatalf("sent messages = %d, want confirm email plus recovery notification", got)
+	}
+	if !strings.Contains(sender.messages[1], "余额已恢复") || !strings.Contains(sender.messages[1], tokenHashPrefix(tokenHash)) {
+		t.Fatalf("recovery notification missing expected copy or token prefix:\n%s", sender.messages[1])
+	}
+	token := dataStore.tokens[tokenHash]
+	if !token.otherResetExpired || token.expireReason != store.ConfirmTokenExpireReasonOtherReset {
+		t.Fatalf("token was not marked other reset expired: %+v", token)
+	}
+	if _, err := monitor.Confirm(ctx, rawToken); !errors.Is(err, store.ErrTokenInvalid) {
+		t.Fatalf("Confirm(old token) error = %v, want ErrTokenInvalid", err)
+	}
+
+	status, err = monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("second recovered Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("second recovered Tick() status = %s, want ok", status)
+	}
+	if got := len(sender.messages); got != 2 {
+		t.Fatalf("sent messages after second recovered Tick = %d, want 2", got)
+	}
+}
+
+func TestRecoveredBalanceWithoutActiveConfirmTokenIsOKAndDoesNotNotify(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.75}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("Tick() status = %s, want ok", status)
+	}
+	if got := len(sender.messages); got != 0 {
+		t.Fatalf("sent messages = %d, want 0", got)
+	}
+}
+
 func TestConfirmEmailUsesButtonCopyFallbackAndMidnightExpiry(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0.4}
@@ -380,6 +453,72 @@ func TestCancelResetEmailsMarksManualCancelledAndDoesNotBlockFlow(t *testing.T) 
 	}
 	if got := len(sender.messages); got != 2 {
 		t.Fatalf("sent messages after cancel = %d, want 2", got)
+	}
+}
+
+func TestOtherResetInvalidationOnlyTouchesActiveConfirmTokens(t *testing.T) {
+	ctx := context.Background()
+	dataStore := newFakeStore()
+	now := time.Now()
+
+	activeHash := hashToken("active")
+	if err := dataStore.CreateConfirmToken(ctx, activeHash, 0.4, now.Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.MarkConfirmTokenEmailSent(ctx, activeHash); err != nil {
+		t.Fatal(err)
+	}
+
+	usedHash := hashToken("used")
+	if err := dataStore.CreateConfirmToken(ctx, usedHash, 0.4, now.Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.MarkConfirmTokenEmailSent(ctx, usedHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dataStore.ConsumeConfirmToken(ctx, usedHash); err != nil {
+		t.Fatal(err)
+	}
+
+	cancelledHash := hashToken("cancelled")
+	if err := dataStore.CreateConfirmToken(ctx, cancelledHash, 0.4, now.Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.MarkConfirmTokenEmailSent(ctx, cancelledHash); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := dataStore.tokens[cancelledHash]
+	cancelled.cancelled = true
+	dataStore.tokens[cancelledHash] = cancelled
+
+	expiredHash := hashToken("expired")
+	if err := dataStore.CreateConfirmToken(ctx, expiredHash, 0.4, now.Add(-time.Minute), store.ConfirmTokenExpireReasonTTL); err != nil {
+		t.Fatal(err)
+	}
+	expired := dataStore.tokens[expiredHash]
+	expired.emailSent = true
+	expired.emailSentAt = now.Add(-time.Hour)
+	dataStore.tokens[expiredHash] = expired
+
+	unsentHash := hashToken("unsent")
+	if err := dataStore.CreateConfirmToken(ctx, unsentHash, 0.4, now.Add(time.Hour), store.ConfirmTokenExpireReasonTTL); err != nil {
+		t.Fatal(err)
+	}
+
+	invalidated, err := dataStore.InvalidateActiveConfirmTokensForOtherReset(ctx)
+	if err != nil {
+		t.Fatalf("InvalidateActiveConfirmTokensForOtherReset() error = %v", err)
+	}
+	if len(invalidated) != 1 || invalidated[0].TokenHash != activeHash {
+		t.Fatalf("invalidated = %+v, want only active token", invalidated)
+	}
+	if !dataStore.tokens[activeHash].otherResetExpired {
+		t.Fatal("active token was not marked other reset expired")
+	}
+	for _, tokenHash := range []string{usedHash, cancelledHash, expiredHash, unsentHash} {
+		if dataStore.tokens[tokenHash].otherResetExpired {
+			t.Fatalf("non-active token %s was marked other reset expired: %+v", tokenHash, dataStore.tokens[tokenHash])
+		}
 	}
 }
 
@@ -1215,6 +1354,7 @@ type fakeToken struct {
 	expired                 bool
 	startupSelfCheckExpired bool
 	autoResetExpired        bool
+	otherResetExpired       bool
 	expireReason            store.ConfirmTokenExpireReason
 }
 
@@ -1300,6 +1440,29 @@ func (f *fakeStore) InvalidateActiveConfirmTokensOnStartup(context.Context) ([]s
 	return invalidated, nil
 }
 
+func (f *fakeStore) InvalidateActiveConfirmTokensForOtherReset(context.Context) ([]store.InvalidatedConfirmToken, error) {
+	var invalidated []store.InvalidatedConfirmToken
+	now := time.Now()
+	for tokenHash, token := range f.tokens {
+		if !token.emailSent || token.used || token.cancelled || token.expired || token.startupSelfCheckExpired || token.autoResetExpired || token.otherResetExpired || !token.expiresAt.After(now) {
+			continue
+		}
+		token.otherResetExpired = true
+		token.expireReason = store.ConfirmTokenExpireReasonOtherReset
+		token.invalidatedAt = now
+		f.tokens[tokenHash] = token
+		invalidated = append(invalidated, store.InvalidatedConfirmToken{
+			TokenHash:     tokenHash,
+			Balance:       token.balance,
+			CreatedAt:     token.createdAt,
+			EmailSentAt:   token.emailSentAt,
+			ExpiresAt:     token.expiresAt,
+			InvalidatedAt: token.invalidatedAt,
+		})
+	}
+	return invalidated, nil
+}
+
 func (f *fakeStore) ExpireAutoResetInvalidatedConfirmTokens(context.Context) (int64, error) {
 	var expired int64
 	now := time.Now()
@@ -1319,7 +1482,7 @@ func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {
 	_, _ = f.ExpireAutoResetInvalidatedConfirmTokens(context.Background())
 	now := time.Now()
 	for _, token := range f.tokens {
-		if token.emailSent && !token.used && !token.cancelled && !token.expired && !token.startupSelfCheckExpired && token.expiresAt.After(now) {
+		if token.emailSent && !token.used && !token.cancelled && !token.expired && !token.startupSelfCheckExpired && !token.otherResetExpired && token.expiresAt.After(now) {
 			return true, nil
 		}
 	}
@@ -1343,7 +1506,7 @@ func (f *fakeStore) MarkConfirmTokenEmailSent(_ context.Context, tokenHash strin
 func (f *fakeStore) ConsumeConfirmToken(_ context.Context, tokenHash string) (store.ConfirmToken, error) {
 	_, _ = f.ExpireAutoResetInvalidatedConfirmTokens(context.Background())
 	token, ok := f.tokens[tokenHash]
-	if !ok || !token.emailSent || token.used || token.cancelled || token.expired || token.startupSelfCheckExpired || token.expiresAt.Before(time.Now()) {
+	if !ok || !token.emailSent || token.used || token.cancelled || token.expired || token.startupSelfCheckExpired || token.otherResetExpired || token.expiresAt.Before(time.Now()) {
 		return store.ConfirmToken{}, store.ErrTokenInvalid
 	}
 	token.used = true
