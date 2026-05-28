@@ -61,6 +61,8 @@ type Store interface {
 	InvalidateActiveConfirmTokensOnStartup(ctx context.Context) ([]InvalidatedConfirmToken, error)
 	InvalidateActiveConfirmTokensForOtherReset(ctx context.Context) ([]InvalidatedConfirmToken, error)
 	ExpireAutoResetInvalidatedConfirmTokens(ctx context.Context) (int64, error)
+	PendingAutoResetExpiredConfirmTokenNotifications(ctx context.Context) ([]InvalidatedConfirmToken, error)
+	MarkAutoResetExpiredConfirmTokenNotificationsSent(ctx context.Context, tokenHashes []string) error
 	HasActiveConfirmToken(ctx context.Context) (bool, error)
 	MarkConfirmTokenEmailSent(ctx context.Context, tokenHash string) error
 	ConsumeConfirmToken(ctx context.Context, tokenHash string) (ConfirmToken, error)
@@ -134,9 +136,18 @@ func (p *Postgres) Init(ctx context.Context) error {
 		 WHERE status IS NULL OR status = ''`,
 		`ALTER TABLE confirm_tokens ALTER COLUMN status SET DEFAULT 'created'`,
 		`ALTER TABLE confirm_tokens ALTER COLUMN status SET NOT NULL`,
+		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS auto_reset_expired_notification_required BOOLEAN`,
+		`UPDATE confirm_tokens
+		 SET auto_reset_expired_notification_required = false
+		 WHERE auto_reset_expired_notification_required IS NULL`,
+		`ALTER TABLE confirm_tokens ALTER COLUMN auto_reset_expired_notification_required SET DEFAULT false`,
+		`ALTER TABLE confirm_tokens ALTER COLUMN auto_reset_expired_notification_required SET NOT NULL`,
+		`ALTER TABLE confirm_tokens ADD COLUMN IF NOT EXISTS auto_reset_expired_notification_sent_at TIMESTAMPTZ`,
 		`DELETE FROM confirm_tokens WHERE used_at IS NULL AND email_sent_at IS NULL`,
 		`DROP INDEX IF EXISTS confirm_tokens_active_idx`,
 		`CREATE INDEX IF NOT EXISTS confirm_tokens_active_idx ON confirm_tokens (expires_at) WHERE used_at IS NULL AND email_sent_at IS NOT NULL AND status = 'email_sent'`,
+		`CREATE INDEX IF NOT EXISTS confirm_tokens_auto_reset_notification_idx ON confirm_tokens (invalidated_at)
+		 WHERE auto_reset_expired_notification_required = true AND auto_reset_expired_notification_sent_at IS NULL`,
 		`CREATE TABLE IF NOT EXISTS daily_reset_limit_state (
 			day DATE PRIMARY KEY,
 			daily_limit_email_sent BOOLEAN NOT NULL DEFAULT false,
@@ -272,7 +283,11 @@ func (p *Postgres) ExpireAutoResetInvalidatedConfirmTokens(ctx context.Context) 
 	result, err := p.db.ExecContext(ctx,
 		`UPDATE confirm_tokens
 		 SET status = CASE WHEN expire_reason = 'auto_reset' THEN 'auto_reset_expired' ELSE 'expired' END,
-		     invalidated_at = CASE WHEN expire_reason = 'auto_reset' THEN now() ELSE invalidated_at END
+		     invalidated_at = CASE WHEN expire_reason = 'auto_reset' THEN COALESCE(invalidated_at, now()) ELSE invalidated_at END,
+		     auto_reset_expired_notification_required = CASE
+		       WHEN expire_reason = 'auto_reset' THEN true
+		       ELSE auto_reset_expired_notification_required
+		     END
 		 WHERE email_sent_at IS NOT NULL
 		   AND used_at IS NULL
 		   AND status = 'email_sent'
@@ -282,6 +297,64 @@ func (p *Postgres) ExpireAutoResetInvalidatedConfirmTokens(ctx context.Context) 
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+func (p *Postgres) PendingAutoResetExpiredConfirmTokenNotifications(ctx context.Context) ([]InvalidatedConfirmToken, error) {
+	rows, err := p.db.QueryContext(ctx,
+		`SELECT token_hash, balance, created_at, email_sent_at, expires_at, invalidated_at
+		 FROM confirm_tokens
+		 WHERE status = 'auto_reset_expired'
+		   AND auto_reset_expired_notification_required = true
+		   AND auto_reset_expired_notification_sent_at IS NULL
+		 ORDER BY invalidated_at ASC, id ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []InvalidatedConfirmToken
+	for rows.Next() {
+		var token InvalidatedConfirmToken
+		if err := rows.Scan(&token.TokenHash, &token.Balance, &token.CreatedAt, &token.EmailSentAt, &token.ExpiresAt, &token.InvalidatedAt); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return tokens, nil
+}
+
+func (p *Postgres) MarkAutoResetExpiredConfirmTokenNotificationsSent(ctx context.Context, tokenHashes []string) error {
+	if len(tokenHashes) == 0 {
+		return nil
+	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE confirm_tokens
+		 SET auto_reset_expired_notification_sent_at = now()
+		 WHERE token_hash = $1
+		   AND auto_reset_expired_notification_required = true
+		   AND auto_reset_expired_notification_sent_at IS NULL`,
+	)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, tokenHash := range tokenHashes {
+		if _, err := stmt.ExecContext(ctx, tokenHash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (p *Postgres) HasActiveConfirmToken(ctx context.Context) (bool, error) {

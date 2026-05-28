@@ -177,6 +177,9 @@ func (m *Monitor) tickAndLog(ctx context.Context) time.Duration {
 func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 	cfg := m.snapshot()
 	start := m.businessNow(cfg)
+	if err := m.notifyAutoResetExpiredConfirmTokens(ctx, cfg); err != nil {
+		m.logger.Printf("auto-reset expired confirm token notification failed error=%v", err)
+	}
 	state, stateErr := m.dailyResetLimitState(ctx, cfg, start)
 	if stateErr != nil {
 		entry := QueryLogEntry{
@@ -228,6 +231,9 @@ func (m *Monitor) handleTick(ctx context.Context) (string, error) {
 		return entry.Status, err
 	}
 	entry.Balance = &result.Balance
+	if result.Source != "" && result.Source != "usage" {
+		entry.BalanceSource = result.Source
+	}
 	m.observeBalance(start, result.Balance)
 
 	status, actionErr := m.handleBalance(ctx, result.Balance, start)
@@ -515,6 +521,57 @@ func (m *Monitor) sendBalanceRecoveredInvalidatedConfirmTokensEmail(ctx context.
 	var body strings.Builder
 	body.WriteString(fmt.Sprintf("当前余额已经恢复到低余额阈值及以上，因此系统判定订阅额度已经通过其他方式恢复。\n\n当前余额：%.6f\n低余额阈值：%.6f\n失效链接数量：%d\n\n", balance, cfg.LowBalanceThreshold, len(tokens)))
 	body.WriteString("以下未点击的重置确认链接已经自动失效。请忽略之前的重置邮件，避免同一次余额不足触发多次重置。\n")
+	for i, token := range tokens {
+		body.WriteString(fmt.Sprintf("\n%d. 旧链接：/confirm-reset?token=<token_hash_prefix:%s>\n", i+1, tokenHashPrefix(token.TokenHash)))
+		body.WriteString(fmt.Sprintf("   触发时余额：%.6f\n", token.Balance))
+		body.WriteString(fmt.Sprintf("   发送时间：%s\n", formatEmailTime(token.EmailSentAt, location)))
+		body.WriteString(fmt.Sprintf("   原过期时间：%s\n", formatEmailTime(token.ExpiresAt, location)))
+		body.WriteString(fmt.Sprintf("   失效时间：%s\n", formatEmailTime(token.InvalidatedAt, location)))
+	}
+	return m.mailer.Send(ctx, subject, body.String())
+}
+
+func (m *Monitor) notifyAutoResetExpiredConfirmTokens(ctx context.Context, cfg config.Config) error {
+	if _, err := m.store.ExpireAutoResetInvalidatedConfirmTokens(ctx); err != nil {
+		return err
+	}
+	tokens, err := m.store.PendingAutoResetExpiredConfirmTokenNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	if len(tokens) == 0 {
+		return nil
+	}
+	if err := m.sendAutoResetExpiredConfirmTokensEmail(ctx, cfg, tokens); err != nil {
+		return err
+	}
+	tokenHashes := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		tokenHashes = append(tokenHashes, token.TokenHash)
+	}
+	if err := m.store.MarkAutoResetExpiredConfirmTokenNotificationsSent(ctx, tokenHashes); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.pendingManualEmail = false
+	m.mu.Unlock()
+	m.logger.Printf("auto-reset expired confirm token notification sent invalidated=%d", len(tokens))
+	return nil
+}
+
+func (m *Monitor) sendAutoResetExpiredConfirmTokensEmail(ctx context.Context, cfg config.Config, tokens []store.InvalidatedConfirmToken) error {
+	freshCfg, refreshErr := m.refreshEmailConfig()
+	if refreshErr != nil {
+		m.logger.Printf("auto-reset expired notification config refresh failed error=%v", refreshErr)
+	} else {
+		cfg = freshCfg
+	}
+
+	location := cfg.BusinessLocation()
+	subject := "0 点自动重置导致旧重置链接失效"
+	var body strings.Builder
+	body.WriteString("业务日 0 点后，系统已将以下未点击的重置确认链接标记为自动重置失效。\n\n")
+	body.WriteString("这些旧链接已经不能再用于重置订阅额度，请忽略之前的余额不足重置邮件；如仍然余额不足，服务会按当前余额状态重新发送新的确认邮件。\n")
 	for i, token := range tokens {
 		body.WriteString(fmt.Sprintf("\n%d. 旧链接：/confirm-reset?token=<token_hash_prefix:%s>\n", i+1, tokenHashPrefix(token.TokenHash)))
 		body.WriteString(fmt.Sprintf("   触发时余额：%.6f\n", token.Balance))

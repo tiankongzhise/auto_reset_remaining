@@ -39,6 +39,7 @@ type Client struct {
 type BalanceResult struct {
 	Balance float64
 	Raw     json.RawMessage
+	Source  string
 }
 
 type ResetResult struct {
@@ -49,9 +50,19 @@ type ResetResult struct {
 }
 
 type Subscription struct {
-	ID       int64  `json:"id"`
-	Status   string `json:"status"`
-	CanReset bool   `json:"canReset"`
+	ID            int64             `json:"id"`
+	Status        string            `json:"status"`
+	CanReset      bool              `json:"canReset"`
+	DailyUsage    float64           `json:"dailyUsage"`
+	DailyUsageUSD float64           `json:"daily_usage_usd"`
+	DailyLimit    float64           `json:"dailyLimit"`
+	DailyLimitUSD float64           `json:"daily_limit_usd"`
+	Group         SubscriptionGroup `json:"group"`
+}
+
+type SubscriptionGroup struct {
+	DailyLimit    float64 `json:"dailyLimit"`
+	DailyLimitUSD float64 `json:"daily_limit_usd"`
 }
 
 func NewClient(cfg Config) *Client {
@@ -74,7 +85,14 @@ func (c *Client) QueryBalance(ctx context.Context) (BalanceResult, error) {
 	if err != nil {
 		return BalanceResult{}, err
 	}
-	return BalanceResult{Balance: balance, Raw: append([]byte(nil), body...)}, nil
+	result := BalanceResult{Balance: balance, Raw: append([]byte(nil), body...), Source: "usage"}
+	if balance <= 0 {
+		if fallbackBalance, err := c.subscriptionFallbackBalance(ctx); err == nil && fallbackBalance > 0 {
+			result.Balance = fallbackBalance
+			result.Source = "subscription_fallback"
+		}
+	}
+	return result, nil
 }
 
 func (c *Client) ValidateUsageAPIKey(ctx context.Context) error {
@@ -159,6 +177,63 @@ func (c *Client) selectSubscription(ctx context.Context) (Subscription, error) {
 		}
 	}
 	return Subscription{}, fmt.Errorf("no active resettable subscription found")
+}
+
+func (c *Client) subscriptionFallbackBalance(ctx context.Context) (float64, error) {
+	subscriptions, err := c.ListSubscriptions(ctx)
+	if err != nil {
+		return 0, err
+	}
+	subscription, err := c.selectBalanceSubscription(subscriptions)
+	if err != nil {
+		return 0, err
+	}
+	limit := subscription.dailyLimit()
+	if limit <= 0 {
+		return 0, fmt.Errorf("subscription %d missing daily limit", subscription.ID)
+	}
+	remaining := limit - subscription.dailyUsage()
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, nil
+}
+
+func (c *Client) selectBalanceSubscription(subscriptions []Subscription) (Subscription, error) {
+	if c.cfg.SubscriptionID > 0 {
+		for _, subscription := range subscriptions {
+			if subscription.ID == c.cfg.SubscriptionID {
+				return subscription, nil
+			}
+		}
+		return Subscription{}, fmt.Errorf("configured subscription %d not found", c.cfg.SubscriptionID)
+	}
+	for _, subscription := range subscriptions {
+		if strings.EqualFold(subscription.Status, "active") {
+			return subscription, nil
+		}
+	}
+	return Subscription{}, fmt.Errorf("no active subscription found")
+}
+
+func (s Subscription) dailyLimit() float64 {
+	switch {
+	case s.DailyLimit > 0:
+		return s.DailyLimit
+	case s.DailyLimitUSD > 0:
+		return s.DailyLimitUSD
+	case s.Group.DailyLimit > 0:
+		return s.Group.DailyLimit
+	default:
+		return s.Group.DailyLimitUSD
+	}
+}
+
+func (s Subscription) dailyUsage() float64 {
+	if s.DailyUsage != 0 {
+		return s.DailyUsage
+	}
+	return s.DailyUsageUSD
 }
 
 func (c *Client) ListSubscriptions(ctx context.Context) ([]Subscription, error) {

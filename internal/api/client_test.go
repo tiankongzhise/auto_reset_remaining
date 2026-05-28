@@ -35,6 +35,134 @@ func TestClientQueryBalance(t *testing.T) {
 	if result.Balance != 0.25 {
 		t.Fatalf("Balance = %v, want 0.25", result.Balance)
 	}
+	if result.Source != "usage" {
+		t.Fatalf("Source = %q, want usage", result.Source)
+	}
+}
+
+func TestClientQueryBalanceUsesSubscriptionFallbackWhenUsageIsZero(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/usage":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"user": map[string]any{"balance": 0}}})
+		case "/api/v1/auth/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{"access_token": "access-token", "expires_in": 3600},
+			})
+		case "/api/subscriptions":
+			if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+				t.Fatalf("subscriptions Authorization = %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"subscriptions": []map[string]any{
+					{
+						"id":         1716,
+						"status":     "active",
+						"dailyUsage": 2.39581,
+						"group": map[string]any{
+							"dailyLimit": 100,
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		RayPlusBaseURL:  server.URL,
+		RayPlusAPIKey:   "sk-test",
+		RayPlusEmail:    "user@example.com",
+		RayPlusPassword: "password",
+		CodexBaseURL:    server.URL,
+		SubscriptionID:  1716,
+		UserAgent:       "test-agent",
+	})
+	result, err := client.QueryBalance(context.Background())
+	if err != nil {
+		t.Fatalf("QueryBalance() error = %v", err)
+	}
+	if result.Balance != 97.60419 {
+		t.Fatalf("Balance = %.5f, want 97.60419", result.Balance)
+	}
+	if result.Source != "subscription_fallback" {
+		t.Fatalf("Source = %q, want subscription_fallback", result.Source)
+	}
+}
+
+func TestClientQueryBalanceFallbackUsesConfiguredSubscription(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/usage":
+			_ = json.NewEncoder(w).Encode(map[string]any{"balance": 0})
+		case "/api/v1/auth/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{"access_token": "access-token", "expires_in": 3600},
+			})
+		case "/api/subscriptions":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"subscriptions": []map[string]any{
+					{"id": 111, "status": "active", "dailyUsage": 20, "group": map[string]any{"dailyLimit": 100}},
+					{"id": 222, "status": "active", "dailyUsage": 3, "group": map[string]any{"dailyLimit": 50}},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		RayPlusBaseURL:  server.URL,
+		RayPlusAPIKey:   "sk-test",
+		RayPlusEmail:    "user@example.com",
+		RayPlusPassword: "password",
+		CodexBaseURL:    server.URL,
+		SubscriptionID:  222,
+		UserAgent:       "test-agent",
+	})
+	result, err := client.QueryBalance(context.Background())
+	if err != nil {
+		t.Fatalf("QueryBalance() error = %v", err)
+	}
+	if result.Balance != 47 {
+		t.Fatalf("Balance = %v, want configured subscription remaining 47", result.Balance)
+	}
+}
+
+func TestClientQueryBalanceKeepsUsageZeroWhenFallbackFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/usage":
+			_ = json.NewEncoder(w).Encode(map[string]any{"balance": 0})
+		case "/api/v1/auth/login":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"temporarily unavailable"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		RayPlusBaseURL:  server.URL,
+		RayPlusAPIKey:   "sk-test",
+		RayPlusEmail:    "user@example.com",
+		RayPlusPassword: "password",
+		CodexBaseURL:    server.URL,
+		UserAgent:       "test-agent",
+	})
+	result, err := client.QueryBalance(context.Background())
+	if err != nil {
+		t.Fatalf("QueryBalance() error = %v", err)
+	}
+	if result.Balance != 0 || result.Source != "usage" {
+		t.Fatalf("QueryBalance() = %+v, want usage zero", result)
+	}
 }
 
 func TestClientValidateUsageAPIKeyRejectsInvalidKey(t *testing.T) {

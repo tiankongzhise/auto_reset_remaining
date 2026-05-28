@@ -555,6 +555,140 @@ func TestAutoResetExpiredConfirmTokenDoesNotBlockFlow(t *testing.T) {
 	}
 }
 
+func TestAutoResetExpiredConfirmTokenNotificationSendsOnceAndDoesNotLeakRawToken(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.75}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	rawToken := "expired-by-midnight"
+	tokenHash := hashToken(rawToken)
+	dataStore.tokens[tokenHash] = fakeToken{
+		id:           1,
+		balance:      0.4,
+		createdAt:    time.Now().Add(-2 * time.Hour),
+		expiresAt:    time.Now().Add(-time.Minute),
+		emailSent:    true,
+		emailSentAt:  time.Now().Add(-time.Hour),
+		expireReason: store.ConfirmTokenExpireReasonAutoReset,
+	}
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+	monitor.mu.Lock()
+	monitor.pendingManualEmail = true
+	monitor.mu.Unlock()
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("Tick() status = %s, want ok", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages = %d, want 1 auto-reset notification", got)
+	}
+	if !strings.Contains(sender.messages[0], "0 点自动重置导致旧重置链接失效") || !strings.Contains(sender.messages[0], tokenHashPrefix(tokenHash)) {
+		t.Fatalf("auto-reset notification missing subject or token prefix:\n%s", sender.messages[0])
+	}
+	if strings.Contains(sender.messages[0], rawToken) {
+		t.Fatalf("auto-reset notification leaked raw token:\n%s", sender.messages[0])
+	}
+	if !dataStore.tokens[tokenHash].autoResetNotificationSent {
+		t.Fatal("auto-reset notification was not marked sent")
+	}
+	monitor.mu.Lock()
+	pending := monitor.pendingManualEmail
+	monitor.mu.Unlock()
+	if pending {
+		t.Fatal("pendingManualEmail was not cleared")
+	}
+
+	status, err = monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("second Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("second Tick() status = %s, want ok", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages after second Tick = %d, want no duplicate notification", got)
+	}
+}
+
+func TestAutoResetExpiredConfirmTokenNotificationFailureRetries(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 0.75}
+	notifyErr := errors.New("smtp unavailable")
+	sender := &fakeMailer{err: notifyErr}
+	dataStore := newFakeStore()
+	tokenHash := hashToken("retry-auto-reset-notification")
+	dataStore.tokens[tokenHash] = fakeToken{
+		id:           1,
+		balance:      0.4,
+		createdAt:    time.Now().Add(-2 * time.Hour),
+		expiresAt:    time.Now().Add(-time.Minute),
+		emailSent:    true,
+		emailSentAt:  time.Now().Add(-time.Hour),
+		expireReason: store.ConfirmTokenExpireReasonAutoReset,
+	}
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("Tick() status = %s, want ok despite notification failure", status)
+	}
+	if dataStore.tokens[tokenHash].autoResetNotificationSent {
+		t.Fatal("failed notification should not be marked sent")
+	}
+
+	sender.err = nil
+	status, err = monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("retry Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("retry Tick() status = %s, want ok", status)
+	}
+	if got := len(sender.messages); got != 1 {
+		t.Fatalf("sent messages after retry = %d, want 1", got)
+	}
+	if !dataStore.tokens[tokenHash].autoResetNotificationSent {
+		t.Fatal("retry notification was not marked sent")
+	}
+}
+
+func TestTickLogsBalanceSource(t *testing.T) {
+	ctx := context.Background()
+	apiClient := &fakeAPI{balance: 97.60419, balanceSource: "subscription_fallback"}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+
+	status, err := monitor.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("Tick() status = %s, want ok", status)
+	}
+	entries, err := os.ReadDir(monitor.cfg.QueryLogDir)
+	if err != nil {
+		t.Fatalf("read query log dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("query log files = %d, want 1", len(entries))
+	}
+	body, err := os.ReadFile(filepath.Join(monitor.cfg.QueryLogDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read query log: %v", err)
+	}
+	if !strings.Contains(string(body), `"balance_source":"subscription_fallback"`) {
+		t.Fatalf("query log missing balance source:\n%s", body)
+	}
+}
+
 func TestStartupInvalidatesActiveConfirmTokensAndNotifies(t *testing.T) {
 	ctx := context.Background()
 	apiClient := &fakeAPI{balance: 0.4}
@@ -1269,12 +1403,13 @@ interval = "1m"
 `
 
 type fakeAPI struct {
-	balance      float64
-	balanceErr   error
-	resetResult  api.ResetResult
-	resetErr     error
-	balanceCalls int
-	resetCalls   int
+	balance       float64
+	balanceSource string
+	balanceErr    error
+	resetResult   api.ResetResult
+	resetErr      error
+	balanceCalls  int
+	resetCalls    int
 }
 
 func (f *fakeAPI) QueryBalance(context.Context) (api.BalanceResult, error) {
@@ -1282,7 +1417,11 @@ func (f *fakeAPI) QueryBalance(context.Context) (api.BalanceResult, error) {
 	if f.balanceErr != nil {
 		return api.BalanceResult{}, f.balanceErr
 	}
-	return api.BalanceResult{Balance: f.balance}, nil
+	source := f.balanceSource
+	if source == "" {
+		source = "usage"
+	}
+	return api.BalanceResult{Balance: f.balance, Source: source}, nil
 }
 
 func (f *fakeAPI) ResetQuota(context.Context) (api.ResetResult, error) {
@@ -1342,20 +1481,22 @@ type fakeStore struct {
 }
 
 type fakeToken struct {
-	id                      int64
-	balance                 float64
-	createdAt               time.Time
-	expiresAt               time.Time
-	emailSentAt             time.Time
-	invalidatedAt           time.Time
-	used                    bool
-	emailSent               bool
-	cancelled               bool
-	expired                 bool
-	startupSelfCheckExpired bool
-	autoResetExpired        bool
-	otherResetExpired       bool
-	expireReason            store.ConfirmTokenExpireReason
+	id                            int64
+	balance                       float64
+	createdAt                     time.Time
+	expiresAt                     time.Time
+	emailSentAt                   time.Time
+	invalidatedAt                 time.Time
+	autoResetNotificationRequired bool
+	autoResetNotificationSent     bool
+	used                          bool
+	emailSent                     bool
+	cancelled                     bool
+	expired                       bool
+	startupSelfCheckExpired       bool
+	autoResetExpired              bool
+	otherResetExpired             bool
+	expireReason                  store.ConfirmTokenExpireReason
 }
 
 func newFakeStore() *fakeStore {
@@ -1472,10 +1613,51 @@ func (f *fakeStore) ExpireAutoResetInvalidatedConfirmTokens(context.Context) (in
 		}
 		token.expired = true
 		token.autoResetExpired = token.expireReason == store.ConfirmTokenExpireReasonAutoReset
+		if token.autoResetExpired {
+			token.autoResetNotificationRequired = true
+			if token.invalidatedAt.IsZero() {
+				token.invalidatedAt = now
+			}
+		}
 		f.tokens[tokenHash] = token
 		expired++
 	}
 	return expired, nil
+}
+
+func (f *fakeStore) PendingAutoResetExpiredConfirmTokenNotifications(ctx context.Context) ([]store.InvalidatedConfirmToken, error) {
+	if _, err := f.ExpireAutoResetInvalidatedConfirmTokens(ctx); err != nil {
+		return nil, err
+	}
+	var tokens []store.InvalidatedConfirmToken
+	for tokenHash, token := range f.tokens {
+		if !token.autoResetExpired || !token.autoResetNotificationRequired || token.autoResetNotificationSent {
+			continue
+		}
+		tokens = append(tokens, store.InvalidatedConfirmToken{
+			TokenHash:     tokenHash,
+			Balance:       token.balance,
+			CreatedAt:     token.createdAt,
+			EmailSentAt:   token.emailSentAt,
+			ExpiresAt:     token.expiresAt,
+			InvalidatedAt: token.invalidatedAt,
+		})
+	}
+	return tokens, nil
+}
+
+func (f *fakeStore) MarkAutoResetExpiredConfirmTokenNotificationsSent(_ context.Context, tokenHashes []string) error {
+	for _, tokenHash := range tokenHashes {
+		token, ok := f.tokens[tokenHash]
+		if !ok {
+			continue
+		}
+		if token.autoResetNotificationRequired && !token.autoResetNotificationSent {
+			token.autoResetNotificationSent = true
+			f.tokens[tokenHash] = token
+		}
+	}
+	return nil
 }
 
 func (f *fakeStore) HasActiveConfirmToken(context.Context) (bool, error) {

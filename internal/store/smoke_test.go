@@ -52,13 +52,23 @@ func TestSmokeLocalConfigAndPostgresSchema(t *testing.T) {
 		"email_sent_at":  false,
 		"invalidated_at": false,
 		"expire_reason":  false,
+		"auto_reset_expired_notification_required": false,
+		"auto_reset_expired_notification_sent_at":  false,
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT column_name
 		FROM information_schema.columns
 		WHERE table_schema = current_schema()
 		  AND table_name = 'confirm_tokens'
-		  AND column_name IN ('status', 'cancelled_at', 'email_sent_at', 'invalidated_at', 'expire_reason')`)
+		  AND column_name IN (
+		    'status',
+		    'cancelled_at',
+		    'email_sent_at',
+		    'invalidated_at',
+		    'expire_reason',
+		    'auto_reset_expired_notification_required',
+		    'auto_reset_expired_notification_sent_at'
+		  )`)
 	if err != nil {
 		t.Fatalf("query confirm_tokens columns: %v", err)
 	}

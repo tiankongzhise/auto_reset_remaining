@@ -18,11 +18,12 @@ type QueryLogger struct {
 }
 
 type QueryLogEntry struct {
-	Time       time.Time `json:"time"`
-	Status     string    `json:"status"`
-	Balance    *float64  `json:"balance,omitempty"`
-	DurationMS int64     `json:"duration_ms"`
-	Error      string    `json:"error,omitempty"`
+	Time          time.Time `json:"time"`
+	Status        string    `json:"status"`
+	Balance       *float64  `json:"balance,omitempty"`
+	BalanceSource string    `json:"balance_source,omitempty"`
+	DurationMS    int64     `json:"duration_ms"`
+	Error         string    `json:"error,omitempty"`
 }
 
 type LogRotationResult struct {

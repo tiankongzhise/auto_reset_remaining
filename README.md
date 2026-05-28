@@ -4,7 +4,7 @@
 
 ## 工作流程
 
-1. 服务按配置查询 `GET /v1/usage` 获取当前余额。该接口是唯一余额来源；如果启动校验明确返回 `INVALID_API_KEY`，服务会直接退出。
+1. 服务按配置查询 `GET /v1/usage` 获取当前余额；如果该接口在 0 点后仍返回 stale `0`，服务会用订阅接口的 `dailyLimit - dailyUsage` 做正余额回补。如果启动校验明确返回 `INVALID_API_KEY`，服务会直接退出。
 2. 未开启自动重置时，余额低于 `reset.low_balance_threshold` 会发送一封确认邮件。
 3. 用户点击邮件中的 `/confirm-reset?token=...` 链接后，服务调用 Codex 重置订阅额度。
 4. 人工确认重置成功累计 3 次后，服务会在 `config.toml` 中开启 `reset.auto_reset_enabled`。
@@ -123,7 +123,7 @@ GET /generate-replay-nonce?endpoint=/resend-reset-email&key=<RESEND_RESET_EMAIL_
 
 生成接口只生成参数，不会预占用这个参数。真正的防重放记录会在目标接口处理请求前写入数据库；同一个 endpoint 下重复使用相同 `replay_nonce` 会返回 409，并提示防重放参数已经被处理过。不同 endpoint 可以使用相同的 `replay_nonce`。`/confirm-reset?token=...` 不需要 `replay_nonce`，因为它不是直接通过 key 访问的接口。
 
-确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在 `app.timezone` 的 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`。如果发送确认邮件后余额查询发现当前余额已经恢复到 `reset.low_balance_threshold` 及以上，服务会将未点击的确认链接标记为 `other_reset_expired`，并发送邮件提示余额已经通过其他方式恢复，旧重置链接已自动失效。
+确认邮件会同时发送 HTML 按钮和纯文本兜底。支持 HTML 的邮箱客户端会显示“重置订阅”按钮；如果按钮不能点击，邮件正文下方也会提供可复制访问的网址。由于每日 0 点系统会自动重置订阅，确认链接最晚会在 `app.timezone` 的 0 点失效；因此失效的邮件记录会在数据库中标记为 `auto_reset_expired`，并单独发送“0 点自动重置导致旧重置链接失效”邮件。该通知只会针对新发生的自动过期记录发送；发送失败会在后续轮询中重试，且通知内容只包含 token hash 前缀，不包含原始 token。如果发送确认邮件后余额查询发现当前余额已经恢复到 `reset.low_balance_threshold` 及以上，服务会将未点击的确认链接标记为 `other_reset_expired`，并发送邮件提示余额已经通过其他方式恢复，旧重置链接已自动失效。
 
 如果自动发送确认邮件失败，或需要让旧确认链接作废并重新发送一封确认邮件，可以调用补发接口：
 
@@ -214,6 +214,12 @@ manual_confirm_time_range = "22:00-09:00"
 {"time":"2026-05-23T22:02:09+08:00","status":"ok","balance":76.8342548,"duration_ms":377}
 ```
 
+当 `/v1/usage` 返回 stale `0` 且订阅接口回补出正余额时，日志会额外写入 `balance_source`：
+
+```json
+{"time":"2026-05-29T06:27:45+08:00","status":"ok","balance":97.60419,"balance_source":"subscription_fallback","duration_ms":2450}
+```
+
 日志轮转配置在 `config.toml`：
 
 ```toml
@@ -238,5 +244,5 @@ GET /rotate-logs?key=<LOG_ROTATION_KEY>&replay_nonce=<REPLAY_NONCE>
 - 启动时报 `missing config file config.toml`：复制 `config.example.toml` 为 `config.toml`。
 - 启动时报缺少配置：检查 `.env` 是否按 `.env.example` 填写，`config.toml` 是否按 `config.example.toml` 填写。
 - 邮件确认链接打不开：检查 `http.public_base_url` 是否是收件人能访问的公网地址。
-- 查询余额解析失败：设置 `rayplus.balance_json_path` 指向 usage 响应里的余额字段；如果 `/v1/usage` 明确返回 `INVALID_API_KEY`，请修复 `.env` 里的 `RAYPLUS_API_KEY` 后重启。
+- 查询余额解析失败：设置 `rayplus.balance_json_path` 指向 usage 响应里的余额字段；如果 `/v1/usage` 在 0 点后短时间仍返回 `0`，服务会尝试用订阅接口回补正余额，并在日志中记录 `balance_source=subscription_fallback`；如果 `/v1/usage` 明确返回 `INVALID_API_KEY`，请修复 `.env` 里的 `RAYPLUS_API_KEY` 后重启。
 - PostgreSQL 连接失败：检查 `.env` 中的 `pg_host`、`pg_port`、`pg_user`、`pg_password`、`pg_database`，以及 `config.toml` 中的 `postgres.sslmode`。
