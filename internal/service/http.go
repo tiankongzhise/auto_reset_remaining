@@ -33,6 +33,40 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/balance", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(balanceDashboardHTML))
+	})
+	mux.HandleFunc("/api/balance", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		dashboard, err := balanceDashboardSnapshot(monitor)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(dashboard)
+	})
+	mux.HandleFunc("/api/balance/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if _, ok := w.(http.Flusher); !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		streamBalanceDashboard(w, r, monitor)
+	})
 	mux.HandleFunc("/generate-replay-nonce", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -257,6 +291,60 @@ func NewHTTPHandler(monitor *Monitor, rotator *LogRotator) http.Handler {
 		_ = json.NewEncoder(w).Encode(result)
 	})
 	return mux
+}
+
+func balanceDashboardSnapshot(monitor *Monitor) (BalanceDashboard, error) {
+	if monitor == nil || monitor.queries == nil {
+		return BalanceDashboard{}, errors.New("balance monitor is not configured")
+	}
+	cfg := monitor.snapshot()
+	return monitor.queries.BalanceDashboard(monitor.businessNow(cfg), cfg.BusinessLocation(), cfg.Polling.BalanceChangeEpsilon)
+}
+
+func streamBalanceDashboard(w http.ResponseWriter, r *http.Request, monitor *Monitor) {
+	flusher := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	send := func() bool {
+		dashboard, err := balanceDashboardSnapshot(monitor)
+		if err != nil {
+			writeSSE(w, "error", map[string]string{"error": err.Error()})
+			flusher.Flush()
+			return false
+		}
+		writeSSE(w, "balance", dashboard)
+		flusher.Flush()
+		return true
+	}
+	if !send() {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
+}
+
+func writeSSE(w http.ResponseWriter, event string, value any) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		payload = []byte(`{"error":"encode event"}`)
+	}
+	if event != "" {
+		_, _ = fmt.Fprintf(w, "event: %s\n", event)
+	}
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
 }
 
 func manualResetHTTPStatus(err error) int {

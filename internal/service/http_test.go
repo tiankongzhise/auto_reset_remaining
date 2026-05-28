@@ -1,12 +1,15 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"auto_reset_remaining/internal/config"
 )
@@ -317,5 +320,83 @@ func TestGenerateReplayNonceHTTPHandler(t *testing.T) {
 	}
 	if other.Endpoint != "/test-reset-email" || other.ReplayNonce != "1" {
 		t.Fatalf("other result = %+v, want test endpoint nonce 1", other)
+	}
+}
+
+func TestBalanceDashboardHTTPHandler(t *testing.T) {
+	apiClient := &fakeAPI{balance: 0.4}
+	sender := &fakeMailer{}
+	dataStore := newFakeStore()
+	monitor := newTestMonitor(t, apiClient, sender, dataStore, config.Config{})
+	if err := os.MkdirAll(monitor.queries.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Join([]string{
+		`{"time":"2026-05-28T02:03:24+08:00","status":"ok","balance":82.1455066,"duration_ms":1161}`,
+		`{"time":"2026-05-28T13:55:16+08:00","status":"balance_error","duration_ms":331,"error":"usage API returned HTTP 401"}`,
+		`{"time":"2026-05-28T22:55:57+08:00","status":"ok","balance":45.0348754,"duration_ms":424}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(monitor.queries.dir, "query-2026-05-28.jsonl"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHTTPHandler(monitor, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/balance", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("api status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var dashboard BalanceDashboard
+	if err := json.Unmarshal(recorder.Body.Bytes(), &dashboard); err != nil {
+		t.Fatalf("decode dashboard: %v", err)
+	}
+	if dashboard.Current == nil || dashboard.Current.Balance != 45.0348754 {
+		t.Fatalf("current = %+v, want latest valid balance", dashboard.Current)
+	}
+	if dashboard.Ignored.ErrorRecords != 1 {
+		t.Fatalf("ignored error records = %d, want 1", dashboard.Ignored.ErrorRecords)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/balance", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("page status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(recorder.Body.String(), `new EventSource("/api/balance/events")`) {
+		t.Fatalf("page does not connect to balance events")
+	}
+}
+
+func TestBalanceDashboardEventsStopsWhenRequestIsCancelled(t *testing.T) {
+	apiClient := &fakeAPI{balance: 0.4}
+	monitor := newTestMonitor(t, apiClient, &fakeMailer{}, newFakeStore(), config.Config{})
+	if err := os.MkdirAll(monitor.queries.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(monitor.queries.dir, "query.jsonl"), []byte(`{"time":"2026-05-28T02:03:24+08:00","status":"ok","balance":82.1455066,"duration_ms":1161}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHTTPHandler(monitor, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	request := httptest.NewRequest(http.MethodGet, "/api/balance/events", nil).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event stream did not stop after request cancellation")
+	}
+	if !strings.Contains(recorder.Body.String(), "event: balance") {
+		t.Fatalf("event stream body = %q, want balance event", recorder.Body.String())
 	}
 }
